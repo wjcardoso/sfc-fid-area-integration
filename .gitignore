@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.python-version
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Editor / notebook
+.vscode/
+.idea/
+.ipynb_checkpoints/
+Thumbs.db
+Desktop.ini
+
+# Logs and local state
+*.log
+.RData
+.Rhistory
+__verify_batch_prompt.py
+
+# Dados brutos, relatórios e anexos locais
+E037/
+E01943/
+Nafta/
+Padroes/
+*.esd
+*.pdf
+*.csv
+*.xlsx
+*.dat.asc
+*.asc.txt
+
