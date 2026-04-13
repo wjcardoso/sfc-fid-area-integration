@@ -48,9 +48,11 @@ def preencher_tabela(
         return
 
     tabela.setRowCount(len(df))
-    for linha, (_, registro) in enumerate(df.iterrows()):
-        for coluna, nome_coluna in enumerate(colunas):
-            valor = registro[nome_coluna]
+    colunas_idx = [df.columns.get_loc(nome_coluna) for nome_coluna in colunas]
+    for linha, registro in enumerate(df.itertuples(index=False, name=None)):
+        for coluna, idx_coluna in enumerate(colunas_idx):
+            nome_coluna = colunas[coluna]
+            valor = registro[idx_coluna]
             item = QTableWidgetItem(formatar_valor_tabela(valor))
             item.setTextAlignment(Qt.AlignCenter)
             if nome_coluna not in colunas_editaveis:

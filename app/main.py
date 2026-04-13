@@ -1,4 +1,4 @@
-﻿"""Ponto de entrada da aplicação SFC."""
+"""Ponto de entrada da aplicação SFC na arquitetura modular app/."""
 
 from app.ui.main_window import main
 

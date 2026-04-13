@@ -104,7 +104,12 @@ def calcular_area_pico_local(
     inicio_idx: int,
     fim_idx: int,
 ) -> float:
-    """Integra o pico acima de uma baseline local linear entre início e fim."""
+    """Integra o pico por regra do trapézio no sinal corrigido e não-negativo.
+
+    O sinal recebido já passou por correção de baseline em `normalizar_dataframe`,
+    então evitar uma segunda subtração local deixa a integração mais estável e
+    monotônica: ao ampliar o intervalo, a área não diminui artificialmente.
+    """
     if fim_idx <= inicio_idx:
         return 0.0
 
@@ -113,8 +118,7 @@ def calcular_area_pico_local(
     if len(x) < 2:
         return 0.0
 
-    baseline_local = np.linspace(y[0], y[-1], num=len(y))
-    return float(trapezoid(np.maximum(y - baseline_local, 0.0), x))
+    return float(trapezoid(np.maximum(y, 0.0), x))
 
 
 def _modelo_gaussiano(
@@ -960,7 +964,7 @@ def detectar_picos_dataframe(
     - suavização Savitzky-Golay para reduzir ruído sem deslocar o ápice;
     - filtros por proeminência e largura para reduzir falsos positivos;
     - uso de derivada/curvatura e vales locais para delimitar início/fim;
-    - integração acima de baseline local linear, mais fiel para picos assimétricos.
+    - integração trapezoidal no sinal corrigido e não-negativo.
     """
     tempo = df["Tempo"].to_numpy(dtype=float)
     intensidade = df["Intensidade"].to_numpy(dtype=float)
@@ -1287,9 +1291,6 @@ def aplicar_picos_salvos(
     settings: QSettings, chave: str, picos: pd.DataFrame
 ) -> pd.DataFrame:
     """Sobrescreve picos detectados com edições persistidas do usuário."""
-    if picos.empty:
-        return picos
-
     bruto = settings.value(chave_settings_amostra(chave), "")
     if not bruto:
         return picos
@@ -1301,6 +1302,27 @@ def aplicar_picos_salvos(
 
     if salvos.empty or "Pico" not in salvos.columns:
         return picos
+
+    colunas_padrao = [
+        "Pico",
+        "Tempo (min)",
+        "Altura",
+        "Início",
+        "Fim",
+        "Largura",
+        "Área",
+    ]
+
+    if picos.empty:
+        resultado = salvos.copy()
+        for coluna in colunas_padrao:
+            if coluna not in resultado.columns:
+                resultado[coluna] = 0.0 if coluna != "Pico" else np.nan
+        resultado = resultado[colunas_padrao].copy()
+        resultado = resultado.sort_values("Tempo (min)").reset_index(drop=True)
+        if not resultado.empty:
+            resultado["Pico"] = np.arange(1, len(resultado) + 1, dtype=int)
+        return resultado
 
     resultado = picos.copy()
     for _, row in salvos.iterrows():
@@ -1340,10 +1362,39 @@ def calcular_areas_por_regiao(
     picos: pd.DataFrame,
     regioes_analiticas: list[tuple[str, float, float]],
     colunas_regioes: list[str],
+    dados: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Soma as áreas dos picos por faixa cromatográfica configurada."""
+    """Calcula as áreas por faixa cromatográfica configurada."""
     resumo = criar_dataframe_regioes(regioes_analiticas).copy()
     resumo["Área Total"] = 0.0
+
+    if dados is not None and not dados.empty:
+        tempos_dados = pd.to_numeric(dados.get("Tempo"), errors="coerce")
+        intensidades = pd.to_numeric(dados.get("Intensidade"), errors="coerce").fillna(
+            0.0
+        )
+        tempos_np = tempos_dados.to_numpy(dtype=float)
+        intensidades_np = intensidades.to_numpy(dtype=float)
+
+        for indice, linha in resumo.iterrows():
+            inicio = float(linha["Início (min)"])
+            fim = float(linha["Fim (min)"])
+            if fim < inicio:
+                inicio, fim = fim, inicio
+
+            mascara = (tempos_np >= inicio) & (tempos_np <= fim)
+            idx = np.flatnonzero(mascara)
+            if len(idx) < 2:
+                continue
+
+            resumo.at[indice, "Área Total"] = calcular_area_pico_local(
+                tempos_np,
+                intensidades_np,
+                int(idx[0]),
+                int(idx[-1]),
+            )
+
+        return resumo[colunas_regioes]
 
     if picos.empty:
         return resumo[colunas_regioes]

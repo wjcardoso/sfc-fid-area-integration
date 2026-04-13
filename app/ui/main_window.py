@@ -38,27 +38,11 @@ from PySide6.QtWidgets import (
 )
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 
-from . import constants
-from .canvas import CromatogramaCanvas
-from .models import Amostra
-from .processing import (
-    ajustar_modelos_picos,
-    aplicar_picos_salvos,
-    calcular_areas_por_regiao,
-    carregar_referencias_padrao,
-    chave_settings_amostra,
-    criar_pico_por_intervalo,
-    criar_dataframe_padrao_vazio,
-    criar_dataframe_picos_vazio,
-    criar_referencias_padrao_iniciais,
-    detectar_picos_dataframe,
-    detectar_picos_padrao_referenciados,
-    ler_cromatograma,
-    recalcular_pico_editado,
-    salvar_picos_amostra,
-    salvar_referencias_padrao,
-)
-from .table_utils import configurar_tabela, preencher_tabela, texto_para_float
+from app.controllers.main_controller import MainController
+from app.models.amostra import Amostra
+from app.ui.canvas import CromatogramaCanvas
+from app.utils import constants
+from app.utils.table_utils import configurar_tabela, preencher_tabela, texto_para_float
 
 
 class JanelaPrincipal(QMainWindow):
@@ -95,7 +79,7 @@ class JanelaPrincipal(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SFC - Visualizador de Cromatogramas")
-        self.resize(1280, 800)
+        self.resize(1200, 800)
 
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self._carregar_opcoes_salvas()
@@ -111,9 +95,9 @@ class JanelaPrincipal(QMainWindow):
         self._linha_tempo_cursor = None
         self._linha_tempo_fixo = None
         self._faixa_selecao_manual = None
-        self.referencias_padrao = carregar_referencias_padrao(
-            self.settings,
-            self.COLUNAS_PADRAO,
+        self.controller = MainController(self.settings)
+        self.referencias_padrao = self.controller.load_standard_references(
+            self.COLUNAS_PADRAO
         )
 
         self._criar_menu()
@@ -128,16 +112,14 @@ class JanelaPrincipal(QMainWindow):
         self.canvas.figure.tight_layout(pad=0.5)
         self.canvas.draw_idle()
 
-    @classmethod
-    def _criar_dataframe_picos_vazio(cls) -> pd.DataFrame:
-        return criar_dataframe_picos_vazio(cls.COLUNAS_AMOSTRA)
+    def _criar_dataframe_picos_vazio(self) -> pd.DataFrame:
+        return self.controller.create_empty_peaks(self.COLUNAS_AMOSTRA)
 
-    @classmethod
-    def _criar_dataframe_padrao_vazio(cls) -> pd.DataFrame:
-        return criar_dataframe_padrao_vazio(cls.COLUNAS_AMOSTRA)
+    def _criar_dataframe_padrao_vazio(self) -> pd.DataFrame:
+        return self.controller.create_empty_standard(self.COLUNAS_AMOSTRA)
 
     def _criar_referencias_padrao_iniciais(self) -> pd.DataFrame:
-        return criar_referencias_padrao_iniciais(self.COLUNAS_PADRAO)
+        return self.controller.default_standard_references(self.COLUNAS_PADRAO)
 
     def _normalizar_metodo_analise(self, metodo: str | None) -> str:
         valor = str(metodo or "").strip()
@@ -152,7 +134,7 @@ class JanelaPrincipal(QMainWindow):
         return valor if valor in self.ENSAIOS_DISPONIVEIS else self.ENSAIO_PADRAO
 
     def _chave_setting_metadado_amostra(self, chave: str, campo: str) -> str:
-        chave_picos = chave_settings_amostra(chave)
+        chave_picos = self.controller.sample_settings_key(chave)
         prefixo = (
             chave_picos[: -len("/picos")]
             if chave_picos.endswith("/picos")
@@ -338,23 +320,474 @@ class JanelaPrincipal(QMainWindow):
         area = float(pico.get("Área", 0.0))
         return f"Pico {numero} · {tempo:.4f} min · área {area:.4f}"
 
+    @staticmethod
+    def _para_float_seguro(valor: object) -> float | None:
+        numero = pd.to_numeric(pd.Series([valor]), errors="coerce").iloc[0]
+        return float(numero) if pd.notna(numero) else None
+
+    def _obter_referencia_padrao_composto(
+        self,
+        composto: str,
+    ) -> dict[str, float | None] | None:
+        if self.referencias_padrao.empty or "Composto" not in self.referencias_padrao:
+            return None
+
+        mascara = (
+            self.referencias_padrao["Composto"].astype(str).str.strip().str.casefold()
+            == str(composto).strip().casefold()
+        )
+        if not mascara.any():
+            return None
+
+        linha = self.referencias_padrao.loc[mascara].iloc[0]
+        return {
+            "Tempo (min)": self._para_float_seguro(linha.get("Tempo (min)")),
+            "Início": self._para_float_seguro(linha.get("Início")),
+            "Fim": self._para_float_seguro(linha.get("Fim")),
+        }
+
+    def _calcular_vale_entre_compostos_padrao(
+        self,
+        composto_esquerda: str,
+        composto_direita: str,
+    ) -> float | None:
+        referencia_esquerda = self._obter_referencia_padrao_composto(composto_esquerda)
+        referencia_direita = self._obter_referencia_padrao_composto(composto_direita)
+        if referencia_esquerda is None or referencia_direita is None:
+            return None
+
+        tempo_esquerda = referencia_esquerda.get("Tempo (min)")
+        tempo_direita = referencia_direita.get("Tempo (min)")
+        if (
+            self.padrao is not None
+            and not self.padrao.dados.empty
+            and tempo_esquerda is not None
+            and tempo_direita is not None
+            and tempo_direita > tempo_esquerda
+        ):
+            janela = self.padrao.dados.loc[
+                (self.padrao.dados["Tempo"] >= float(tempo_esquerda))
+                & (self.padrao.dados["Tempo"] <= float(tempo_direita))
+            ]
+            if not janela.empty:
+                indice_vale = janela["Intensidade"].astype(float).idxmin()
+                tempo_vale = self._para_float_seguro(janela.loc[indice_vale, "Tempo"])
+                if tempo_vale is not None:
+                    return tempo_vale
+
+        fim_esquerda = referencia_esquerda.get("Fim")
+        inicio_direita = referencia_direita.get("Início")
+        if fim_esquerda is not None and inicio_direita is not None:
+            return (float(fim_esquerda) + float(inicio_direita)) / 2.0
+        if tempo_esquerda is not None and tempo_direita is not None:
+            return (float(tempo_esquerda) + float(tempo_direita)) / 2.0
+        return fim_esquerda if fim_esquerda is not None else inicio_direita
+
+    @staticmethod
+    def _selecionar_pico_representativo(
+        picos: pd.DataFrame,
+        *,
+        centro: float | None = None,
+        janela: float | None = None,
+        tempo_min: float | None = None,
+        tempo_max: float | None = None,
+        preferir_ultimo: bool = False,
+    ) -> pd.Series | None:
+        if picos.empty or "Tempo (min)" not in picos.columns:
+            return None
+
+        candidatos = picos.copy()
+        candidatos["__tempo__"] = pd.to_numeric(
+            candidatos["Tempo (min)"], errors="coerce"
+        )
+        candidatos["__inicio__"] = pd.to_numeric(candidatos["Início"], errors="coerce")
+        candidatos["__fim__"] = pd.to_numeric(candidatos["Fim"], errors="coerce")
+        candidatos["__area__"] = pd.to_numeric(
+            candidatos.get("Área"), errors="coerce"
+        ).fillna(0.0)
+        candidatos = candidatos[candidatos["__tempo__"].notna()].copy()
+
+        if tempo_min is not None:
+            candidatos = candidatos[candidatos["__tempo__"] >= float(tempo_min)]
+        if tempo_max is not None:
+            candidatos = candidatos[candidatos["__tempo__"] <= float(tempo_max)]
+
+        if centro is not None and janela is not None:
+            dentro_janela = candidatos.loc[
+                (candidatos["__tempo__"] - float(centro)).abs() <= float(janela)
+            ].copy()
+            if not dentro_janela.empty:
+                candidatos = dentro_janela
+
+        if candidatos.empty:
+            return None
+
+        if preferir_ultimo:
+            return candidatos.sort_values(
+                ["__tempo__", "__fim__", "__area__"],
+                ascending=[False, False, False],
+            ).iloc[0]
+
+        if centro is not None:
+            candidatos["__desvio__"] = (candidatos["__tempo__"] - float(centro)).abs()
+            return candidatos.sort_values(
+                ["__desvio__", "__area__", "__fim__"],
+                ascending=[True, False, False],
+            ).iloc[0]
+
+        return candidatos.sort_values(
+            ["__area__", "__tempo__"],
+            ascending=[False, True],
+        ).iloc[0]
+
+    @staticmethod
+    def _estimar_fim_faixa_aromatica(
+        picos: pd.DataFrame,
+        inicio_busca: float,
+        limite_superior: float | None = None,
+    ) -> float | None:
+        if picos.empty:
+            return None
+
+        candidatos = picos.copy()
+        candidatos["__tempo__"] = pd.to_numeric(
+            candidatos["Tempo (min)"], errors="coerce"
+        )
+        candidatos["__inicio__"] = pd.to_numeric(candidatos["Início"], errors="coerce")
+        candidatos["__fim__"] = pd.to_numeric(candidatos["Fim"], errors="coerce")
+        candidatos = candidatos[candidatos["__fim__"].notna()].copy()
+        candidatos = candidatos[candidatos["__fim__"] >= float(inicio_busca)].copy()
+
+        if limite_superior is not None:
+            limite = float(limite_superior)
+            candidatos = candidatos.loc[
+                (candidatos["__inicio__"].fillna(candidatos["__tempo__"]) < limite)
+                & (candidatos["__tempo__"].fillna(limite) <= limite)
+            ].copy()
+
+        if candidatos.empty:
+            return None
+
+        fim = pd.to_numeric(candidatos["__fim__"], errors="coerce").max()
+        return float(fim) if pd.notna(fim) else None
+
+    @staticmethod
+    def _normalizar_intervalos_regioes(
+        regioes: list[tuple[str, float, float]],
+    ) -> list[tuple[str, float, float]]:
+        intervalos_normalizados: list[tuple[str, float, float]] = []
+        fim_anterior: float | None = None
+
+        for nome, inicio, fim in regioes:
+            inicio_float = float(inicio)
+            fim_float = float(fim)
+            if fim_anterior is not None:
+                inicio_float = max(inicio_float, fim_anterior)
+            if fim_float < inicio_float:
+                fim_float = inicio_float
+            intervalos_normalizados.append((nome, inicio_float, fim_float))
+            fim_anterior = fim_float
+
+        return intervalos_normalizados
+
     def _obter_regioes_analiticas(
         self,
         metodo: str | None = None,
         eh_diesel: bool = False,
+        *,
+        picos: pd.DataFrame | None = None,
+        dados: pd.DataFrame | None = None,
     ) -> list[tuple[str, float, float]]:
         metodo_normalizado = self._normalizar_metodo_analise(metodo)
         regioes_por_tipo = self.REGIOES_ANALITICAS_POR_METODO.get(metodo_normalizado)
 
         if isinstance(regioes_por_tipo, dict):
-            return list(
+            regioes_base = list(
                 regioes_por_tipo.get(
                     bool(eh_diesel),
                     regioes_por_tipo.get(False, self.REGIOES_ANALITICAS),
                 )
             )
+        else:
+            regioes_base = list(regioes_por_tipo or self.REGIOES_ANALITICAS)
 
-        return list(regioes_por_tipo or self.REGIOES_ANALITICAS)
+        if not regioes_base:
+            return []
+
+        mapa_regioes = {
+            str(nome): (float(inicio), float(fim)) for nome, inicio, fim in regioes_base
+        }
+
+        def resolver_intervalo(
+            nome: str,
+            inicio: float | None,
+            fim: float | None,
+        ) -> tuple[float, float]:
+            inicio_base, fim_base = mapa_regioes.get(str(nome), (0.0, 0.0))
+            inicio_final = (
+                float(inicio)
+                if inicio is not None and pd.notna(inicio)
+                else float(inicio_base)
+            )
+            fim_final = (
+                float(fim) if fim is not None and pd.notna(fim) else float(fim_base)
+            )
+            return inicio_final, fim_final
+
+        picos_validos = (
+            picos.copy()
+            if picos is not None and not picos.empty and "Tempo (min)" in picos.columns
+            else self._criar_dataframe_picos_vazio()
+        )
+        if picos_validos.empty and dados is not None and not dados.empty:
+            try:
+                picos_validos = self._detectar_picos_amostra(dados)
+            except Exception:
+                picos_validos = self._criar_dataframe_picos_vazio()
+
+        if not picos_validos.empty:
+            picos_validos["Tempo (min)"] = pd.to_numeric(
+                picos_validos["Tempo (min)"], errors="coerce"
+            )
+            picos_validos["Início"] = pd.to_numeric(
+                picos_validos["Início"], errors="coerce"
+            )
+            picos_validos["Fim"] = pd.to_numeric(picos_validos["Fim"], errors="coerce")
+            picos_validos = picos_validos.sort_values("Tempo (min)").reset_index(
+                drop=True
+            )
+
+        inicio_amostra = None
+        if not picos_validos.empty and picos_validos["Início"].notna().any():
+            inicio_amostra = float(picos_validos["Início"].dropna().min())
+
+        tempo_final_corrida = None
+        if dados is not None and not dados.empty and "Tempo" in dados.columns:
+            tempo_final = pd.to_numeric(dados["Tempo"], errors="coerce").max()
+            if pd.notna(tempo_final):
+                tempo_final_corrida = float(tempo_final)
+        if (
+            tempo_final_corrida is None
+            and not picos_validos.empty
+            and picos_validos["Fim"].notna().any()
+        ):
+            tempo_final_corrida = float(picos_validos["Fim"].dropna().max())
+
+        referencia_tolueno = self._obter_referencia_padrao_composto("Tolueno") or {}
+        referencia_naftaleno = self._obter_referencia_padrao_composto("Naftaleno") or {}
+        referencia_dibenzotiofeno = (
+            self._obter_referencia_padrao_composto("Dibenzotiofeno") or {}
+        )
+
+        limite_hexadecano_tolueno = self._calcular_vale_entre_compostos_padrao(
+            "Hexadecano",
+            "Tolueno",
+        )
+        inicio_tolueno = referencia_tolueno.get("Início") or referencia_tolueno.get(
+            "Tempo (min)"
+        )
+        tempo_naftaleno = referencia_naftaleno.get("Tempo (min)")
+        inicio_naftaleno = referencia_naftaleno.get("Início") or tempo_naftaleno
+        fim_dibenzotiofeno = referencia_dibenzotiofeno.get(
+            "Fim"
+        ) or referencia_dibenzotiofeno.get("Tempo (min)")
+
+        pico_saturados_pesados = self._selecionar_pico_representativo(
+            picos_validos,
+            centro=25.0,
+            janela=1.8,
+        )
+        inicio_saturados_pesados = self._para_float_seguro(
+            pico_saturados_pesados.get("Início")
+            if pico_saturados_pesados is not None
+            else None
+        )
+        fim_saturados_pesados = self._para_float_seguro(
+            pico_saturados_pesados.get("Fim")
+            if pico_saturados_pesados is not None
+            else None
+        )
+
+        limite_inferior_olefinas = max(
+            26.0,
+            float(fim_saturados_pesados) if fim_saturados_pesados is not None else 26.0,
+        )
+        pico_olefinas = self._selecionar_pico_representativo(
+            picos_validos,
+            centro=27.0,
+            janela=4.0,
+            tempo_min=limite_inferior_olefinas,
+            preferir_ultimo=True,
+        )
+        inicio_olefinas = self._para_float_seguro(
+            pico_olefinas.get("Início") if pico_olefinas is not None else None
+        )
+
+        limite_superior_aromaticos = None
+        for candidato in (inicio_saturados_pesados, inicio_olefinas):
+            if candidato is None:
+                continue
+            limite_superior_aromaticos = (
+                float(candidato)
+                if limite_superior_aromaticos is None
+                else min(limite_superior_aromaticos, float(candidato))
+            )
+
+        marcadores_aromaticos = [
+            valor
+            for valor in (fim_dibenzotiofeno, tempo_naftaleno, inicio_tolueno)
+            if valor is not None
+        ]
+        inicio_busca_final = (
+            max(float(valor) for valor in marcadores_aromaticos)
+            if marcadores_aromaticos
+            else None
+        )
+
+        fim_aromaticos = (
+            self._estimar_fim_faixa_aromatica(
+                picos_validos,
+                float(inicio_busca_final),
+                limite_superior_aromaticos,
+            )
+            if inicio_busca_final is not None
+            else None
+        )
+        if fim_aromaticos is not None and limite_superior_aromaticos is not None:
+            fim_aromaticos = min(
+                float(fim_aromaticos), float(limite_superior_aromaticos)
+            )
+
+        if metodo_normalizado == "ASTM D6550":
+            if eh_diesel:
+                inicio_saturados, fim_saturados = resolver_intervalo(
+                    "Saturados",
+                    inicio_amostra,
+                    limite_hexadecano_tolueno,
+                )
+                inicio_mono, fim_mono = resolver_intervalo(
+                    "Mono-aromaticos",
+                    inicio_tolueno,
+                    inicio_naftaleno,
+                )
+                inicio_di, fim_di = resolver_intervalo(
+                    "Di-aromaticos",
+                    inicio_naftaleno,
+                    fim_dibenzotiofeno,
+                )
+                inicio_tri, fim_tri = resolver_intervalo(
+                    "Tri-aromaticos+",
+                    fim_dibenzotiofeno,
+                    fim_aromaticos,
+                )
+                inicio_pesados, fim_pesados = resolver_intervalo(
+                    "Saturados pesados",
+                    inicio_saturados_pesados,
+                    fim_saturados_pesados,
+                )
+                inicio_olef, fim_olef = resolver_intervalo(
+                    "Olefinas",
+                    inicio_olefinas,
+                    tempo_final_corrida,
+                )
+                return self._normalizar_intervalos_regioes(
+                    [
+                        ("Saturados", inicio_saturados, fim_saturados),
+                        ("Mono-aromaticos", inicio_mono, fim_mono),
+                        ("Di-aromaticos", inicio_di, fim_di),
+                        ("Tri-aromaticos+", inicio_tri, fim_tri),
+                        ("Saturados pesados", inicio_pesados, fim_pesados),
+                        ("Olefinas", inicio_olef, fim_olef),
+                    ]
+                )
+
+            inicio_saturados, fim_saturados = resolver_intervalo(
+                "Saturados",
+                inicio_amostra,
+                limite_hexadecano_tolueno,
+            )
+            inicio_mono, fim_mono = resolver_intervalo(
+                "Mono-aromaticos",
+                inicio_tolueno,
+                tempo_naftaleno,
+            )
+            inicio_poli, fim_poli = resolver_intervalo(
+                "Poli-aromaticos",
+                tempo_naftaleno,
+                fim_aromaticos,
+            )
+            inicio_pesados, fim_pesados = resolver_intervalo(
+                "Saturados pesados",
+                inicio_saturados_pesados,
+                fim_saturados_pesados,
+            )
+            inicio_olef, fim_olef = resolver_intervalo(
+                "Olefinas",
+                inicio_olefinas,
+                tempo_final_corrida,
+            )
+            return self._normalizar_intervalos_regioes(
+                [
+                    ("Saturados", inicio_saturados, fim_saturados),
+                    ("Mono-aromaticos", inicio_mono, fim_mono),
+                    ("Poli-aromaticos", inicio_poli, fim_poli),
+                    ("Saturados pesados", inicio_pesados, fim_pesados),
+                    ("Olefinas", inicio_olef, fim_olef),
+                ]
+            )
+
+        if eh_diesel:
+            inicio_nao_aromaticos, fim_nao_aromaticos = resolver_intervalo(
+                "Não-aromaticos",
+                inicio_amostra,
+                limite_hexadecano_tolueno,
+            )
+            inicio_mono, fim_mono = resolver_intervalo(
+                "Mono-aromaticos",
+                inicio_tolueno,
+                inicio_naftaleno,
+            )
+            inicio_di, fim_di = resolver_intervalo(
+                "Di-aromaticos",
+                inicio_naftaleno,
+                fim_dibenzotiofeno,
+            )
+            inicio_tri, fim_tri = resolver_intervalo(
+                "Tri-aromaticos+",
+                fim_dibenzotiofeno,
+                fim_aromaticos,
+            )
+            return self._normalizar_intervalos_regioes(
+                [
+                    ("Não-aromaticos", inicio_nao_aromaticos, fim_nao_aromaticos),
+                    ("Mono-aromaticos", inicio_mono, fim_mono),
+                    ("Di-aromaticos", inicio_di, fim_di),
+                    ("Tri-aromaticos+", inicio_tri, fim_tri),
+                ]
+            )
+
+        inicio_nao_aromaticos, fim_nao_aromaticos = resolver_intervalo(
+            "Não-aromaticos",
+            inicio_amostra,
+            limite_hexadecano_tolueno,
+        )
+        inicio_mono, fim_mono = resolver_intervalo(
+            "Mono-aromaticos",
+            inicio_tolueno,
+            tempo_naftaleno,
+        )
+        inicio_poli, fim_poli = resolver_intervalo(
+            "Poli-aromaticos",
+            tempo_naftaleno,
+            fim_aromaticos,
+        )
+        return self._normalizar_intervalos_regioes(
+            [
+                ("Não-aromaticos", inicio_nao_aromaticos, fim_nao_aromaticos),
+                ("Mono-aromaticos", inicio_mono, fim_mono),
+                ("Poli-aromaticos", inicio_poli, fim_poli),
+            ]
+        )
 
     def _obter_metodo_amostra(self, amostra: Amostra | None) -> str:
         if amostra is None:
@@ -526,7 +959,7 @@ class JanelaPrincipal(QMainWindow):
     def _detectar_picos_amostra(
         self, dados: pd.DataFrame, chave: str | None = None
     ) -> pd.DataFrame:
-        picos = detectar_picos_dataframe(
+        picos = self.controller.detect_sample_peaks(
             dados,
             self.COLUNAS_AMOSTRA,
             self.ALTURA_MINIMA_PICO,
@@ -538,10 +971,10 @@ class JanelaPrincipal(QMainWindow):
             rel_height=self.ALTURA_RELATIVA_PICO,
             curvature_factor=self.FATOR_CURVATURA,
         )
-        return aplicar_picos_salvos(self.settings, chave, picos) if chave else picos
+        return self.controller.apply_saved_peaks(chave, picos) if chave else picos
 
     def _detectar_picos_padrao(self, dados: pd.DataFrame) -> pd.DataFrame:
-        return detectar_picos_padrao_referenciados(
+        return self.controller.detect_standard_peaks(
             dados,
             self._criar_referencias_padrao_iniciais(),
             self.COLUNAS_AMOSTRA,
@@ -809,7 +1242,7 @@ class JanelaPrincipal(QMainWindow):
         fim: float,
     ) -> None:
         """Insere o pico calculado na tabela e no gráfico, com renumeração."""
-        novo_pico = criar_pico_por_intervalo(amostra.dados, inicio, fim)
+        novo_pico = self.controller.create_peak_by_interval(amostra.dados, inicio, fim)
         picos_atualizados = pd.concat(
             [amostra.picos, pd.DataFrame([novo_pico])],
             ignore_index=True,
@@ -820,7 +1253,7 @@ class JanelaPrincipal(QMainWindow):
         picos_atualizados["Pico"] = range(1, len(picos_atualizados) + 1)
         amostra.picos = picos_atualizados[self.COLUNAS_AMOSTRA]
 
-        salvar_picos_amostra(self.settings, chave, amostra.picos)
+        self.controller.save_sample_peaks(chave, amostra.picos)
         self._atualizar_tabela(amostra.picos)
         self._atualizar_tabela_regioes(
             amostra.picos,
@@ -878,7 +1311,7 @@ class JanelaPrincipal(QMainWindow):
             amostra.picos = self._criar_dataframe_picos_vazio()
 
         self._limpar_vinculos_grupos_invalidos(chave, amostra.picos)
-        salvar_picos_amostra(self.settings, chave, amostra.picos)
+        self.controller.save_sample_peaks(chave, amostra.picos)
         self._atualizar_tabela(amostra.picos)
         self._atualizar_tabela_regioes(
             amostra.picos,
@@ -915,7 +1348,7 @@ class JanelaPrincipal(QMainWindow):
 
         amostra.picos = self._criar_dataframe_picos_vazio()
         self._limpar_vinculos_grupos_invalidos(chave, amostra.picos)
-        salvar_picos_amostra(self.settings, chave, amostra.picos)
+        self.controller.save_sample_peaks(chave, amostra.picos)
         self._atualizar_tabela(amostra.picos)
         self._atualizar_tabela_regioes(
             amostra.picos,
@@ -1194,7 +1627,17 @@ class JanelaPrincipal(QMainWindow):
         menu_arquivos.addSeparator()
         self._adicionar_acao_menu(menu_arquivos, "SAIR", self.close)
 
-        menu_opcoes = self.menuBar().addMenu("Options")
+        menu_opcoes = self.menuBar().addMenu("OPÇÕES")
+        self._adicionar_acao_menu(
+            menu_opcoes,
+            "ENCONTRAR PICOS",
+            self._encontrar_picos_amostras,
+        )
+        self._adicionar_acao_menu(
+            menu_opcoes,
+            "ENCONTRAR GRUPOS",
+            self._encontrar_grupos_amostras,
+        )
         self._adicionar_acao_menu(
             menu_opcoes,
             "PARÂMETROS DE DETECÇÃO",
@@ -1205,6 +1648,128 @@ class JanelaPrincipal(QMainWindow):
             "RESETAR ZOOM DO GRÁFICO",
             self._restaurar_zoom_original,
         )
+
+    def _encontrar_picos_amostras(self) -> None:
+        if not self.amostras:
+            QMessageBox.information(
+                self,
+                "Encontrar picos",
+                "Carregue ao menos uma amostra antes de procurar picos.",
+            )
+            return
+
+        chave_atual, amostra_atual = self._obter_amostra_atual()
+        if chave_atual is None or amostra_atual is None:
+            QMessageBox.information(
+                self,
+                "Encontrar picos",
+                "Selecione a amostra que deseja processar.",
+            )
+            return
+
+        amostra_atual.picos = self._detectar_picos_amostra(
+            amostra_atual.dados,
+            chave_atual,
+        )
+        self._limpar_vinculos_grupos_invalidos(chave_atual, amostra_atual.picos)
+        self.controller.save_sample_peaks(chave_atual, amostra_atual.picos)
+
+        item_atual = self.lista_arquivos.currentItem()
+        if item_atual is not None:
+            self._ao_selecionar_amostra(item_atual, preservar_visualizacao=True)
+        else:
+            self._mostrar_placeholder()
+
+        self.statusBar().showMessage(
+            f"Encontrados {len(amostra_atual.picos)} pico(s) em {amostra_atual.caminho.name}."
+        )
+
+    def _encontrar_grupos_amostras(self) -> None:
+        if not self.amostras:
+            QMessageBox.information(
+                self,
+                "Encontrar grupos",
+                "Carregue ao menos uma amostra antes de recalcular os grupos.",
+            )
+            return
+
+        chave_atual, amostra_atual = self._obter_amostra_atual()
+        if chave_atual is None or amostra_atual is None:
+            QMessageBox.information(
+                self,
+                "Encontrar grupos",
+                "Selecione a amostra que deseja processar.",
+            )
+            return
+
+        vinculos = self._carregar_vinculos_grupos_amostra(chave_atual)
+        grupos_redefinidos = len(vinculos)
+        if vinculos:
+            self._salvar_vinculos_grupos_amostra(chave_atual, {})
+        self._limpar_vinculos_grupos_invalidos(chave_atual, amostra_atual.picos)
+
+        amostra_atual.picos = self._integrar_grupos_como_picos(
+            chave_atual, amostra_atual
+        )
+        self.controller.save_sample_peaks(chave_atual, amostra_atual.picos)
+
+        item_atual = self.lista_arquivos.currentItem()
+        if item_atual is not None:
+            self._ao_selecionar_amostra(item_atual, preservar_visualizacao=True)
+        else:
+            self._mostrar_placeholder()
+
+        self.statusBar().showMessage(
+            (
+                f"Grupos recalculados automaticamente para {amostra_atual.caminho.name}. "
+                f"{grupos_redefinidos} vínculo(s) manual(is) removido(s)."
+            )
+        )
+
+    def _integrar_grupos_como_picos(
+        self,
+        chave: str,
+        amostra: Amostra,
+    ) -> pd.DataFrame:
+        metodo = self._obter_metodo_amostra(amostra)
+        df_regioes = self._calcular_areas_por_regiao(
+            amostra.picos,
+            metodo,
+            amostra.eh_diesel,
+        )
+
+        if df_regioes.empty:
+            return self._criar_dataframe_picos_vazio()
+
+        picos_integrados: list[dict[str, float | int]] = []
+        for indice, (_, regiao) in enumerate(df_regioes.iterrows(), start=1):
+            inicio = float(regiao["Início (min)"])
+            fim = float(regiao["Fim (min)"])
+            area = float(regiao["Área Total"])
+
+            try:
+                pico_info = self.controller.create_peak_by_interval(
+                    amostra.dados,
+                    inicio,
+                    fim,
+                )
+            except ValueError:
+                pico_info = {}
+
+            linha = {col: 0.0 for col in self.COLUNAS_AMOSTRA}
+            linha.update(
+                {k: v for k, v in pico_info.items() if k in self.COLUNAS_AMOSTRA}
+            )
+            linha["Pico"] = indice
+            linha["Início"] = inicio
+            linha["Fim"] = fim
+            linha["Área"] = area  # use the same integration as the GRUPOS table
+            picos_integrados.append(linha)
+
+        if not picos_integrados:
+            return self._criar_dataframe_picos_vazio()
+
+        return pd.DataFrame(picos_integrados)[self.COLUNAS_AMOSTRA]
 
     def _ao_alterar_visibilidade_grafico(self, _marcado: bool) -> None:
         self.mostrar_amostra = self.check_mostrar_amostra.isChecked()
@@ -1227,9 +1792,9 @@ class JanelaPrincipal(QMainWindow):
             self._mostrar_placeholder()
 
     def abrir_dialogo_opcoes(self) -> None:
-        """Exibe no menu Options os parâmetros de detecção e ajuste de modelo."""
+        """Exibe no menu Opções os parâmetros de detecção e ajuste de modelo."""
         dialogo = QDialog(self)
-        dialogo.setWindowTitle("Options - Parâmetros")
+        dialogo.setWindowTitle("Opções - Parâmetros")
         layout = QVBoxLayout(dialogo)
         formulario = QFormLayout()
 
@@ -1352,7 +1917,7 @@ class JanelaPrincipal(QMainWindow):
         self.settings.setValue("options/modelo_ajuste_pico", self.MODELO_AJUSTE_PICO)
         self.settings.sync()
         self._reprocessar_amostras_carregadas(preservar_visualizacao=True)
-        self.statusBar().showMessage("Parâmetros atualizados em Options.")
+        self.statusBar().showMessage("Parâmetros atualizados em Opções.")
 
     def _criar_interface(self) -> None:
         widget_central = QWidget()
@@ -1366,7 +1931,8 @@ class JanelaPrincipal(QMainWindow):
 
         painel_lateral = QFrame()
         painel_lateral.setFrameShape(QFrame.StyledPanel)
-        painel_lateral.setMinimumWidth(260)
+        painel_lateral.setMinimumWidth(300)
+        painel_lateral.setMaximumWidth(300)
         layout_lateral = QVBoxLayout(painel_lateral)
 
         titulo_lista = QLabel("ARQUIVOS CARREGADOS")
@@ -1448,8 +2014,7 @@ class JanelaPrincipal(QMainWindow):
         layout_grafico.addLayout(barra_visibilidade)
         layout_grafico.addWidget(
             QLabel(
-                "Rolagem: zoom no eixo X | Shift + rolagem: zoom no eixo Y | "
-                "Clique esquerdo 2x: integrar pico manual | Botão direito: resetar zoom"
+                "Rolagem: zoom no eixo X | Shift + rolagem: zoom no eixo Y | Botão direito: resetar zoom"
             )
         )
         layout_grafico.addWidget(self.canvas)
@@ -1472,11 +2037,6 @@ class JanelaPrincipal(QMainWindow):
         botao_remover_todos.clicked.connect(self._remover_todos_picos_amostra)
         barra_acoes_tabela.addWidget(botao_remover_todos)
 
-        barra_acoes_tabela.addWidget(
-            QLabel(
-                "Clique na tabela Amostras para zoom | botão direito em Grupos para vincular picos."
-            )
-        )
         barra_acoes_tabela.addStretch(1)
         layout_tabela.addLayout(barra_acoes_tabela)
 
@@ -1604,7 +2164,7 @@ class JanelaPrincipal(QMainWindow):
             self._mostrar_placeholder()
 
     def _carregar_padrao_de_arquivo(self, caminho: Path) -> None:
-        dados = ler_cromatograma(caminho)
+        dados = self.controller.load_chromatogram(caminho)
         picos_padrao = self._detectar_picos_padrao(dados)
         picos_plot = (
             picos_padrao[self.COLUNAS_AMOSTRA].copy()
@@ -1644,7 +2204,7 @@ class JanelaPrincipal(QMainWindow):
         self.referencias_padrao[self.COLUNA_PERCENTUAL_AREA] = 0.0
 
         if picos_padrao.empty or "Composto" not in picos_padrao.columns:
-            salvar_referencias_padrao(self.settings, self.referencias_padrao)
+            self.controller.save_standard_references(self.referencias_padrao)
             self._atualizar_tabela_padrao()
             return
 
@@ -1674,7 +2234,7 @@ class JanelaPrincipal(QMainWindow):
                 area_pico / total_area_padrao * 100.0 if total_area_padrao > 0 else 0.0
             )
 
-        salvar_referencias_padrao(self.settings, self.referencias_padrao)
+        self.controller.save_standard_references(self.referencias_padrao)
         self._atualizar_tabela_padrao()
 
     def _carregar_amostra(
@@ -1688,8 +2248,11 @@ class JanelaPrincipal(QMainWindow):
         if chave in self.amostras:
             return False
 
-        dados = ler_cromatograma(caminho)
-        picos = self._detectar_picos_amostra(dados, chave)
+        dados = self.controller.load_chromatogram(caminho)
+        picos = self.controller.apply_saved_peaks(
+            chave,
+            self._criar_dataframe_picos_vazio(),
+        )
 
         if metadados is not None:
             metodo_analise, eh_diesel, ensaio = metadados
@@ -1730,6 +2293,8 @@ class JanelaPrincipal(QMainWindow):
     def _ao_selecionar_amostra(
         self,
         item_atual: QListWidgetItem | None,
+        _item_anterior: QListWidgetItem | None = None,
+        *,
         preservar_visualizacao: bool = False,
     ) -> None:
         if item_atual is None:
@@ -1846,14 +2411,16 @@ class JanelaPrincipal(QMainWindow):
             self._desenhar_guias_padrao()
 
         if mostrar_picos and not amostra.picos.empty:
-            for _, pico in amostra.picos.iterrows():
+            cores_picos = ["#90CAF9", "#81C784"]
+            for indice, (_, pico) in enumerate(amostra.picos.iterrows()):
                 inicio = float(pico["Início"])
                 fim = float(pico["Fim"])
                 tempo_pico = float(pico["Tempo (min)"])
                 altura_pico = float(pico["Altura"])
                 numero_pico = str(int(float(pico["Pico"])))
+                cor_faixa = cores_picos[indice % len(cores_picos)]
 
-                self.canvas.ax.axvspan(inicio, fim, color="#1f77b4", alpha=0.06)
+                self.canvas.ax.axvspan(inicio, fim, color=cor_faixa, alpha=0.18)
                 self.canvas.ax.annotate(
                     numero_pico,
                     xy=(tempo_pico, altura_pico),
@@ -1914,7 +2481,7 @@ class JanelaPrincipal(QMainWindow):
         if amostra.picos.empty or self.MODELO_AJUSTE_PICO == "Nenhum":
             return
 
-        ajustes = ajustar_modelos_picos(
+        ajustes = self.controller.fit_peak_models(
             amostra.dados,
             amostra.picos,
             self.MODELO_AJUSTE_PICO,
@@ -1934,11 +2501,17 @@ class JanelaPrincipal(QMainWindow):
         metodo: str | None = None,
         eh_diesel: bool = False,
         picos: pd.DataFrame | None = None,
+        dados: pd.DataFrame | None = None,
         chave_amostra: str | None = None,
     ) -> list[tuple[str, float, float]]:
         intervalos = [
             (nome, float(inicio), float(fim))
-            for nome, inicio, fim in self._obter_regioes_analiticas(metodo, eh_diesel)
+            for nome, inicio, fim in self._obter_regioes_analiticas(
+                metodo,
+                eh_diesel,
+                picos=picos,
+                dados=dados,
+            )
         ]
         if chave_amostra is None or picos is None or picos.empty:
             return intervalos
@@ -1991,6 +2564,7 @@ class JanelaPrincipal(QMainWindow):
             metodo,
             eh_diesel,
             picos=picos,
+            dados=dados,
             chave_amostra=chave_amostra,
         )
 
@@ -2234,7 +2808,8 @@ class JanelaPrincipal(QMainWindow):
         preservar_visualizacao: bool = True,
     ) -> None:
         for chave, amostra in self.amostras.items():
-            amostra.picos = self._detectar_picos_amostra(amostra.dados, chave)
+            if not amostra.picos.empty:
+                amostra.picos = self._detectar_picos_amostra(amostra.dados, chave)
             self._limpar_vinculos_grupos_invalidos(chave, amostra.picos)
 
         if self.padrao is not None:
@@ -2266,7 +2841,7 @@ class JanelaPrincipal(QMainWindow):
             df=self._adicionar_percentual_area(picos, "Área"),
             colunas=self.COLUNAS_AMOSTRA_EXIBICAO,
             colunas_editaveis={"Tempo (min)", "Início", "Fim"},
-            mensagem_vazia="Nenhum pico detectado",
+            mensagem_vazia="Nenhum pico carregado. Use Opções > ENCONTRAR PICOS.",
         )
 
     def _adicionar_percentual_area(
@@ -2314,7 +2889,7 @@ class JanelaPrincipal(QMainWindow):
                 continue
 
             try:
-                pico_integrado = criar_pico_por_intervalo(
+                pico_integrado = self.controller.create_peak_by_interval(
                     self.padrao.dados,
                     float(inicio),
                     float(fim),
@@ -2344,10 +2919,19 @@ class JanelaPrincipal(QMainWindow):
         metodo: str | None = None,
         eh_diesel: bool = False,
     ) -> pd.DataFrame:
-        resumo = calcular_areas_por_regiao(
+        _, amostra_atual = self._obter_amostra_atual()
+        dados_amostra = amostra_atual.dados if amostra_atual is not None else None
+
+        resumo = self.controller.calculate_region_areas(
             picos,
-            self._obter_regioes_analiticas(metodo, eh_diesel),
+            self._obter_regioes_analiticas(
+                metodo,
+                eh_diesel,
+                picos=picos,
+                dados=dados_amostra,
+            ),
             self.COLUNAS_REGIOES,
+            dados=dados_amostra,
         )
 
         chave_atual, _ = self._obter_amostra_atual()
@@ -2464,7 +3048,7 @@ class JanelaPrincipal(QMainWindow):
         self.referencias_padrao.at[item.row(), coluna] = valor
         self._ajustar_intervalo_padrao(item.row())
         self._recalcular_areas_padrao_integradas()
-        salvar_referencias_padrao(self.settings, self.referencias_padrao)
+        self.controller.save_standard_references(self.referencias_padrao)
         self._atualizar_tabela_padrao()
 
         item_atual = self.lista_arquivos.currentItem()
@@ -2514,11 +3098,14 @@ class JanelaPrincipal(QMainWindow):
         indice = amostra.picos.index[item.row()]
         amostra.picos.at[indice, coluna] = valor
 
-        atualizacao = recalcular_pico_editado(amostra.dados, amostra.picos.loc[indice])
+        atualizacao = self.controller.recalc_edited_peak(
+            amostra.dados,
+            amostra.picos.loc[indice],
+        )
         for nome_coluna, valor_atualizado in atualizacao.items():
             amostra.picos.at[indice, nome_coluna] = valor_atualizado
 
-        salvar_picos_amostra(self.settings, chave, amostra.picos)
+        self.controller.save_sample_peaks(chave, amostra.picos)
         self._atualizar_tabela(amostra.picos)
         self._atualizar_tabela_regioes(
             amostra.picos,
