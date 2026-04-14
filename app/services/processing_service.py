@@ -93,8 +93,12 @@ def normalizar_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         base["Tempo"].to_numpy(dtype=float),
         base["Intensidade_Original"].to_numpy(dtype=float),
     )
-    base["Baseline"] = baseline
-    base["Intensidade"] = intensidade_corrigida
+    # Sinal bruto corrigido de baseline — usado para cálculo de área (mesma
+    # convenção do equipamento: integra o inteiro ADC sobre o tempo em segundos)
+    base["Intensidade_Bruta"] = intensidade_corrigida
+    # Sinal em µV para exibição no gráfico
+    base["Baseline"] = baseline * 1e-5
+    base["Intensidade"] = intensidade_corrigida * 1e-5
     return base
 
 
@@ -968,6 +972,9 @@ def detectar_picos_dataframe(
     """
     tempo = df["Tempo"].to_numpy(dtype=float)
     intensidade = df["Intensidade"].to_numpy(dtype=float)
+    # Sinal bruto (sem 1e-5) e tempo em segundos para área equivalente ao equipamento
+    intensidade_bruta = df["Intensidade_Bruta"].to_numpy(dtype=float)
+    tempo_s = tempo * 60.0
 
     if len(intensidade) < 5:
         return criar_dataframe_picos_vazio(colunas_amostra)
@@ -1099,7 +1106,7 @@ def detectar_picos_dataframe(
         if fim_idx <= inicio_idx:
             continue
 
-        area = calcular_area_pico_local(tempo, intensidade, inicio_idx, fim_idx)
+        area = calcular_area_pico_local(tempo_s, intensidade_bruta, inicio_idx, fim_idx)
         largura = max(float(tempo[fim_idx] - tempo[inicio_idx]), 0.0)
         registros_picos.append(
             {
@@ -1322,6 +1329,11 @@ def aplicar_picos_salvos(
         resultado = resultado.sort_values("Tempo (min)").reset_index(drop=True)
         if not resultado.empty:
             resultado["Pico"] = np.arange(1, len(resultado) + 1, dtype=int)
+        # Área, Altura e Largura podem estar em escala antiga — zeradas para
+        # forçar recálculo quando o usuário executar "Encontrar Picos".
+        for coluna in ["Área", "Altura", "Largura"]:
+            if coluna in resultado.columns:
+                resultado[coluna] = 0.0
         return resultado
 
     resultado = picos.copy()
@@ -1332,7 +1344,10 @@ def aplicar_picos_salvos(
         mascara = resultado["Pico"] == int(pico_id)
         if not mascara.any():
             continue
-        for coluna in ["Tempo (min)", "Altura", "Início", "Fim", "Largura", "Área"]:
+        # Apenas os campos que o usuário pode ajustar manualmente são restaurados.
+        # Área, Altura e Largura são grandezas derivadas do sinal e nunca devem
+        # ser sobrescritas por valores salvos (que podem estar em unidades antigas).
+        for coluna in ["Tempo (min)", "Início", "Fim"]:
             valor = pd.to_numeric(row.get(coluna), errors="coerce")
             if pd.notna(valor):
                 resultado.loc[mascara, coluna] = float(valor)
@@ -1370,10 +1385,11 @@ def calcular_areas_por_regiao(
 
     if dados is not None and not dados.empty:
         tempos_dados = pd.to_numeric(dados.get("Tempo"), errors="coerce")
-        intensidades = pd.to_numeric(dados.get("Intensidade"), errors="coerce").fillna(
-            0.0
-        )
-        tempos_np = tempos_dados.to_numpy(dtype=float)
+        intensidades = pd.to_numeric(
+            dados.get("Intensidade_Bruta"), errors="coerce"
+        ).fillna(0.0)
+        tempos_min = tempos_dados.to_numpy(dtype=float)  # minutos — para máscara
+        tempos_s = tempos_min * 60.0  # segundos — para integração
         intensidades_np = intensidades.to_numpy(dtype=float)
 
         for indice, linha in resumo.iterrows():
@@ -1382,13 +1398,13 @@ def calcular_areas_por_regiao(
             if fim < inicio:
                 inicio, fim = fim, inicio
 
-            mascara = (tempos_np >= inicio) & (tempos_np <= fim)
+            mascara = (tempos_min >= inicio) & (tempos_min <= fim)
             idx = np.flatnonzero(mascara)
             if len(idx) < 2:
                 continue
 
             resumo.at[indice, "Área Total"] = calcular_area_pico_local(
-                tempos_np,
+                tempos_s,
                 intensidades_np,
                 int(idx[0]),
                 int(idx[-1]),
@@ -1426,6 +1442,8 @@ def criar_pico_por_intervalo(
     """
     tempos = dados["Tempo"].to_numpy(dtype=float)
     intensidades = dados["Intensidade"].to_numpy(dtype=float)
+    intensidades_brutas = dados["Intensidade_Bruta"].to_numpy(dtype=float)
+    tempos_s = tempos * 60.0  # minutos → segundos para área equivalente ao equipamento
     if len(tempos) < 2:
         raise ValueError("Amostra sem pontos suficientes para criar um pico.")
 
@@ -1453,7 +1471,9 @@ def criar_pico_por_intervalo(
         "Início": float(tempos[idx_inicio]),
         "Fim": float(tempos[idx_fim]),
         "Largura": float(tempos[idx_fim] - tempos[idx_inicio]),
-        "Área": calcular_area_pico_local(tempos, intensidades, idx_inicio, idx_fim),
+        "Área": calcular_area_pico_local(
+            tempos_s, intensidades_brutas, idx_inicio, idx_fim
+        ),
     }
 
 
@@ -1482,6 +1502,7 @@ def recalcular_pico_editado(
 
     tempos = dados["Tempo"].to_numpy(dtype=float)
     intensidades = dados["Intensidade"].to_numpy(dtype=float)
+    intensidades_brutas = dados["Intensidade_Bruta"].to_numpy(dtype=float)
     idx_pico = int(np.abs(tempos - tempo).argmin())
     altura = float(intensidades[idx_pico])
 
@@ -1490,7 +1511,9 @@ def recalcular_pico_editado(
     if idx_inicio > idx_fim:
         idx_inicio, idx_fim = idx_fim, idx_inicio
 
-    area = calcular_area_pico_local(tempos, intensidades, idx_inicio, idx_fim)
+    area = calcular_area_pico_local(
+        tempos * 60.0, intensidades_brutas, idx_inicio, idx_fim
+    )
     largura = max(fim - inicio, 0.0)
 
     return {

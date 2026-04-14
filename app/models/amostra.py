@@ -17,4 +17,3 @@ class Amostra:
     picos: pd.DataFrame
     metodo_analise: str = "ASTM D5186"
     eh_diesel: bool = False
-    ensaio: str = "E037"

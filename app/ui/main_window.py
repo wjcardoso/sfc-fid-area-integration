@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QMenu,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -63,8 +64,6 @@ class JanelaPrincipal(QMainWindow):
     MODELOS_AJUSTE_PICO = constants.MODELOS_AJUSTE_PICO
     METODOS_ANALISE_ASTM = constants.METODOS_ANALISE_ASTM
     METODO_ANALISE_ASTM_PADRAO = constants.METODO_ANALISE_ASTM_PADRAO
-    ENSAIOS_DISPONIVEIS = constants.ENSAIOS_DISPONIVEIS
-    ENSAIO_PADRAO = constants.ENSAIO_PADRAO
     COLUNAS_AMOSTRA = constants.COLUNAS_AMOSTRA
     COLUNAS_PADRAO = constants.COLUNAS_PADRAO
     COLUNAS_REGIOES = constants.COLUNAS_REGIOES
@@ -78,7 +77,9 @@ class JanelaPrincipal(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SFC - Visualizador de Cromatogramas")
+        self.setWindowTitle("Baldur 0.0.1 - CEMEP - SFC Analyzer")
+        _logo = Path(__file__).resolve().parent.parent.parent / "logo.png"
+        self.setWindowIcon(QIcon(str(_logo)))
         self.resize(1200, 800)
 
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
@@ -129,10 +130,6 @@ class JanelaPrincipal(QMainWindow):
             else self.METODO_ANALISE_ASTM_PADRAO
         )
 
-    def _normalizar_ensaio(self, ensaio: str | None) -> str:
-        valor = str(ensaio or "").strip().upper()
-        return valor if valor in self.ENSAIOS_DISPONIVEIS else self.ENSAIO_PADRAO
-
     def _chave_setting_metadado_amostra(self, chave: str, campo: str) -> str:
         chave_picos = self.controller.sample_settings_key(chave)
         prefixo = (
@@ -148,13 +145,6 @@ class JanelaPrincipal(QMainWindow):
     @staticmethod
     def _inferir_eh_diesel_do_caminho(caminho: Path) -> bool:
         return any("DIESEL" in str(parte).upper() for parte in caminho.parts)
-
-    def _inferir_ensaio_do_caminho(self, caminho: Path) -> str:
-        for parte in reversed(caminho.parts):
-            candidato = str(parte).strip().upper()
-            if candidato in self.ENSAIOS_DISPONIVEIS:
-                return candidato
-        return self.ENSAIO_PADRAO
 
     def _carregar_metodo_amostra(self, chave: str) -> str:
         valor = self.settings.value(
@@ -174,20 +164,6 @@ class JanelaPrincipal(QMainWindow):
             padrao,
         )
 
-    def _carregar_ensaio_amostra(
-        self,
-        chave: str,
-        caminho: Path | None = None,
-    ) -> str:
-        padrao = (
-            self._inferir_ensaio_do_caminho(caminho) if caminho else self.ENSAIO_PADRAO
-        )
-        valor = self.settings.value(
-            self._chave_setting_metadado_amostra(chave, "ensaio"),
-            padrao,
-        )
-        return self._normalizar_ensaio(valor)
-
     def _salvar_metodo_amostra(self, chave: str, metodo: str) -> None:
         self.settings.setValue(
             self._chave_setting_metodo_amostra(chave),
@@ -202,20 +178,15 @@ class JanelaPrincipal(QMainWindow):
         )
         self.settings.sync()
 
-    def _salvar_ensaio_amostra(self, chave: str, ensaio: str) -> None:
-        self.settings.setValue(
-            self._chave_setting_metadado_amostra(chave, "ensaio"),
-            self._normalizar_ensaio(ensaio),
-        )
-        self.settings.sync()
-
     def _salvar_metadados_amostra(self, chave: str, amostra: Amostra) -> None:
         self._salvar_metodo_amostra(chave, amostra.metodo_analise)
         self._salvar_diesel_amostra(chave, amostra.eh_diesel)
-        self._salvar_ensaio_amostra(chave, amostra.ensaio)
 
     def _chave_setting_grupos_amostra(self, chave: str) -> str:
         return self._chave_setting_metadado_amostra(chave, "grupos_vinculados")
+
+    def _chave_setting_grupos_zerados_amostra(self, chave: str) -> str:
+        return self._chave_setting_metadado_amostra(chave, "grupos_zerados")
 
     def _carregar_vinculos_grupos_amostra(
         self,
@@ -243,6 +214,34 @@ class JanelaPrincipal(QMainWindow):
         self.settings.setValue(
             self._chave_setting_grupos_amostra(chave),
             json.dumps(vinculos, ensure_ascii=False),
+        )
+        self.settings.sync()
+
+    def _carregar_grupos_zerados_amostra(self, chave: str | None) -> set[str]:
+        if not chave:
+            return set()
+
+        bruto = self.settings.value(
+            self._chave_setting_grupos_zerados_amostra(chave), ""
+        )
+        if not bruto:
+            return set()
+
+        try:
+            grupos = json.loads(str(bruto))
+        except Exception:
+            return set()
+
+        if not isinstance(grupos, list):
+            return set()
+
+        return {str(grupo).strip() for grupo in grupos if str(grupo).strip()}
+
+    def _salvar_grupos_zerados_amostra(self, chave: str, grupos: set[str]) -> None:
+        dados = sorted({str(grupo).strip() for grupo in grupos if str(grupo).strip()})
+        self.settings.setValue(
+            self._chave_setting_grupos_zerados_amostra(chave),
+            json.dumps(dados, ensure_ascii=False),
         )
         self.settings.sync()
 
@@ -797,17 +796,12 @@ class JanelaPrincipal(QMainWindow):
     def _obter_tipo_amostra(self, amostra: Amostra | None) -> str:
         return "Diesel" if amostra is not None and amostra.eh_diesel else "Não diesel"
 
-    def _obter_ensaio_amostra(self, amostra: Amostra | None) -> str:
-        if amostra is None:
-            return self.ENSAIO_PADRAO
-        return self._normalizar_ensaio(amostra.ensaio)
-
     def _perguntar_metadados_amostra(
         self,
         caminho: Path,
         chave: str,
         quantidade_arquivos: int = 1,
-    ) -> tuple[str, bool, str] | None:
+    ) -> tuple[str, bool] | None:
         dialogo = QDialog(self)
         dialogo.setWindowTitle(
             "Informações das amostras"
@@ -819,12 +813,12 @@ class JanelaPrincipal(QMainWindow):
         if quantidade_arquivos > 1:
             texto_descricao = (
                 f"{quantidade_arquivos} arquivo(s) selecionado(s)\n"
-                "Defina ASTM, tipo de amostra e ensaio para todos os arquivos desta carga."
+                "Defina ASTM e tipo de amostra para todos os arquivos desta carga."
             )
         else:
             texto_descricao = (
                 f"Arquivo: {caminho.name}\n"
-                "Defina ASTM, tipo de amostra e ensaio para esta carga."
+                "Defina ASTM e tipo de amostra para esta carga."
             )
 
         descricao = QLabel(texto_descricao)
@@ -846,11 +840,6 @@ class JanelaPrincipal(QMainWindow):
         campo_diesel = QCheckBox("Amostra de diesel", dialogo)
         campo_diesel.setChecked(self._carregar_diesel_amostra(chave, caminho))
         formulario.addRow("Tipo:", campo_diesel)
-
-        campo_ensaio = QComboBox(dialogo)
-        campo_ensaio.addItems(self.ENSAIOS_DISPONIVEIS)
-        campo_ensaio.setCurrentText(self._carregar_ensaio_amostra(chave, caminho))
-        formulario.addRow("Ensaio:", campo_ensaio)
 
         layout.addLayout(formulario)
 
@@ -881,7 +870,6 @@ class JanelaPrincipal(QMainWindow):
         return (
             self._normalizar_metodo_analise(campo_astm.currentText()),
             bool(campo_diesel.isChecked()),
-            self._normalizar_ensaio(campo_ensaio.currentText()),
         )
 
     def _ler_bool_setting(self, chave: str, padrao: bool) -> bool:
@@ -889,6 +877,33 @@ class JanelaPrincipal(QMainWindow):
         if isinstance(valor, bool):
             return valor
         return str(valor).strip().lower() not in {"0", "false", "no", "off", ""}
+
+    def _executar_com_aviso_espera(self, acao, mensagem: str = "Espere...") -> None:
+        aviso = QProgressDialog(mensagem, "", 0, 0, self)
+        aviso.setWindowTitle("Processando")
+        aviso.setWindowModality(Qt.ApplicationModal)
+        aviso.setCancelButton(None)
+        aviso.setMinimumDuration(0)
+        aviso.setAutoClose(False)
+        aviso.setAutoReset(False)
+        aviso.show()
+        QApplication.processEvents()
+        try:
+            acao()
+        finally:
+            aviso.close()
+            aviso.deleteLater()
+            QApplication.processEvents()
+
+    def _conectar_botao_com_aviso_espera(
+        self,
+        botao: QPushButton,
+        acao,
+        mensagem: str = "Espere...",
+    ) -> None:
+        botao.clicked.connect(
+            lambda _checked=False: self._executar_com_aviso_espera(acao, mensagem)
+        )
 
     def _visibilidade_habilitada(self, atributo: str, padrao: bool = True) -> bool:
         controle = getattr(self, atributo, None)
@@ -1407,6 +1422,12 @@ class JanelaPrincipal(QMainWindow):
         acao_limpar = menu.addAction("Usar cálculo automático")
         acao_limpar.setEnabled(grupo in vinculos)
 
+        grupos_zerados = self._carregar_grupos_zerados_amostra(chave)
+        menu.addSeparator()
+        acao_zerar = menu.addAction("Zerar área do grupo")
+        acao_restaurar_area = menu.addAction("Restaurar área calculada")
+        acao_restaurar_area.setEnabled(grupo in grupos_zerados)
+
         selecionada = menu.exec(self.tabela_regioes.viewport().mapToGlobal(pos))
         if selecionada in acoes_picos:
             self._vincular_grupo_a_pico(chave, amostra, grupo, acoes_picos[selecionada])
@@ -1414,6 +1435,48 @@ class JanelaPrincipal(QMainWindow):
             self._zoom_para_pico(amostra, pico_vinculado)
         elif selecionada == acao_limpar:
             self._limpar_vinculo_grupo(chave, amostra, grupo)
+        elif selecionada == acao_zerar:
+            self._zerar_area_grupo(chave, amostra, grupo)
+        elif selecionada == acao_restaurar_area:
+            self._restaurar_area_grupo(chave, amostra, grupo)
+
+    def _zerar_area_grupo(
+        self,
+        chave: str,
+        amostra: Amostra,
+        grupo: str,
+    ) -> None:
+        grupos_zerados = self._carregar_grupos_zerados_amostra(chave)
+        if grupo in grupos_zerados:
+            return
+
+        grupos_zerados.add(grupo)
+        self._salvar_grupos_zerados_amostra(chave, grupos_zerados)
+        self._atualizar_tabela_regioes(
+            amostra.picos,
+            self._obter_metodo_amostra(amostra),
+            amostra.eh_diesel,
+        )
+        self.statusBar().showMessage(f"Área do grupo {grupo} zerada.")
+
+    def _restaurar_area_grupo(
+        self,
+        chave: str,
+        amostra: Amostra,
+        grupo: str,
+    ) -> None:
+        grupos_zerados = self._carregar_grupos_zerados_amostra(chave)
+        if grupo not in grupos_zerados:
+            return
+
+        grupos_zerados.discard(grupo)
+        self._salvar_grupos_zerados_amostra(chave, grupos_zerados)
+        self._atualizar_tabela_regioes(
+            amostra.picos,
+            self._obter_metodo_amostra(amostra),
+            amostra.eh_diesel,
+        )
+        self.statusBar().showMessage(f"Área calculada do grupo {grupo} restaurada.")
 
     def _vincular_grupo_a_pico(
         self,
@@ -1541,9 +1604,6 @@ class JanelaPrincipal(QMainWindow):
         linha_tags.addWidget(
             self._criar_tag_amostra(self._obter_tipo_amostra(amostra), cor_tipo)
         )
-        linha_tags.addWidget(
-            self._criar_tag_amostra(self._obter_ensaio_amostra(amostra), "#7B1FA2")
-        )
         linha_tags.addStretch(1)
         layout.addLayout(linha_tags)
 
@@ -1625,6 +1685,9 @@ class JanelaPrincipal(QMainWindow):
             menu_arquivos, "CARREGAR PADRÃO", self.carregar_padrao
         )
         menu_arquivos.addSeparator()
+        self._adicionar_acao_menu(menu_arquivos, "SALVAR", self.salvar_dados)
+        menu_arquivos.addSeparator()
+
         self._adicionar_acao_menu(menu_arquivos, "SAIR", self.close)
 
         menu_opcoes = self.menuBar().addMenu("OPÇÕES")
@@ -1880,7 +1943,7 @@ class JanelaPrincipal(QMainWindow):
             campo_curvatura.setValue(float(constants.FATOR_CURVATURA))
             campo_modelo.setCurrentText(constants.MODELO_AJUSTE_PICO)
 
-        botao_resetar.clicked.connect(resetar_campos)
+        self._conectar_botao_com_aviso_espera(botao_resetar, resetar_campos)
         botoes.accepted.connect(dialogo.accept)
         botoes.rejected.connect(dialogo.reject)
         layout.addWidget(botoes)
@@ -1950,7 +2013,7 @@ class JanelaPrincipal(QMainWindow):
         layout_lateral.addWidget(self.label_resumo)
 
         botao_carregar = QPushButton("ADICIONAR ARQUIVOS")
-        botao_carregar.clicked.connect(self.abrir_arquivos)
+        self._conectar_botao_com_aviso_espera(botao_carregar, self.abrir_arquivos)
         layout_lateral.addWidget(botao_carregar)
 
         splitter_horizontal.addWidget(painel_lateral)
@@ -2026,15 +2089,24 @@ class JanelaPrincipal(QMainWindow):
 
         barra_acoes_tabela = QHBoxLayout()
         botao_adicionar_pico = QPushButton("ADICIONAR PICO")
-        botao_adicionar_pico.clicked.connect(self._adicionar_pico_manual)
+        self._conectar_botao_com_aviso_espera(
+            botao_adicionar_pico,
+            self._adicionar_pico_manual,
+        )
         barra_acoes_tabela.addWidget(botao_adicionar_pico)
 
         botao_remover_pico = QPushButton("REMOVER PICO")
-        botao_remover_pico.clicked.connect(self._remover_pico_selecionado)
+        self._conectar_botao_com_aviso_espera(
+            botao_remover_pico,
+            self._remover_pico_selecionado,
+        )
         barra_acoes_tabela.addWidget(botao_remover_pico)
 
         botao_remover_todos = QPushButton("REMOVER TODOS")
-        botao_remover_todos.clicked.connect(self._remover_todos_picos_amostra)
+        self._conectar_botao_com_aviso_espera(
+            botao_remover_todos,
+            self._remover_todos_picos_amostra,
+        )
         barra_acoes_tabela.addWidget(botao_remover_todos)
 
         barra_acoes_tabela.addStretch(1)
@@ -2060,7 +2132,7 @@ class JanelaPrincipal(QMainWindow):
         self.tabela_regioes = QTableWidget()
         configurar_tabela(self.tabela_regioes, self.COLUNAS_REGIOES_EXIBICAO)
         self.tabela_regioes.setToolTip(
-            "Clique com o botão direito em uma linha para vincular o grupo a um pico da amostra."
+            "Clique com o botão direito em uma linha para vincular o grupo a um pico da amostra e zerar/restaurar a área."
         )
         self.tabela_regioes.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tabela_regioes.customContextMenuRequested.connect(
@@ -2133,6 +2205,74 @@ class JanelaPrincipal(QMainWindow):
         self.lista_arquivos.clear()
         self._mostrar_placeholder()
         self.statusBar().showMessage("Lista de arquivos limpa.")
+
+    def salvar_dados(self) -> None:
+        """Salva a tabela de grupos de cada amostra em '<nome>_baldur.dat' na mesma pasta."""
+        if not self.amostras:
+            QMessageBox.information(self, "Salvar", "Nenhuma amostra carregada.")
+            return
+
+        salvos = 0
+        erros: list[str] = []
+        for chave, amostra in self.amostras.items():
+            try:
+                metodo = self._obter_metodo_amostra(amostra)
+                regioes = self._obter_regioes_analiticas(
+                    metodo,
+                    amostra.eh_diesel,
+                    picos=amostra.picos,
+                    dados=amostra.dados,
+                )
+                resumo = self.controller.calculate_region_areas(
+                    amostra.picos,
+                    regioes,
+                    self.COLUNAS_REGIOES,
+                    dados=amostra.dados,
+                )
+
+                vinculos = self._carregar_vinculos_grupos_amostra(chave)
+                if vinculos and not amostra.picos.empty and not resumo.empty:
+                    for indice, linha in resumo.iterrows():
+                        grupo = str(linha.get("Grupos", "")).strip()
+                        pico_vinculado = self._resolver_pico_vinculado(
+                            amostra.picos, vinculos.get(grupo)
+                        )
+                        if pico_vinculado is None:
+                            continue
+                        for campo, coluna in [
+                            ("Início", "Início (min)"),
+                            ("Fim", "Fim (min)"),
+                            ("Área", "Área Total"),
+                        ]:
+                            valor = pd.to_numeric(
+                                pd.Series([pico_vinculado.get(campo)]), errors="coerce"
+                            ).iloc[0]
+                            if pd.notna(valor):
+                                resumo.at[indice, coluna] = float(valor)
+
+                grupos_zerados = self._carregar_grupos_zerados_amostra(chave)
+                if grupos_zerados:
+                    for indice, linha in resumo.iterrows():
+                        if str(linha.get("Grupos", "")).strip() in grupos_zerados:
+                            resumo.at[indice, "Área Total"] = 0.0
+
+                df = self._adicionar_percentual_area(resumo, "Área Total")
+                caminho_saida = amostra.caminho.parent / (
+                    amostra.caminho.stem + "_baldur.dat"
+                )
+                df[self.COLUNAS_REGIOES_EXIBICAO].to_csv(
+                    caminho_saida, sep="\t", index=False, float_format="%.4f"
+                )
+                salvos += 1
+            except Exception as exc:
+                erros.append(f"- {amostra.caminho.name}: {exc}")
+
+        mensagem = f"{salvos} arquivo(s) salvo(s)."
+        if erros:
+            mensagem += "\n\nErros:\n" + "\n".join(erros)
+            QMessageBox.warning(self, "Salvar", mensagem)
+        else:
+            QMessageBox.information(self, "Salvar", mensagem)
 
     def carregar_padrao(self) -> None:
         """Carrega o cromatograma de referência utilizado na comparação."""
@@ -2242,29 +2382,25 @@ class JanelaPrincipal(QMainWindow):
         caminho: Path,
         *,
         perguntar_metadados: bool = True,
-        metadados: tuple[str, bool, str] | None = None,
+        metadados: tuple[str, bool] | None = None,
     ) -> bool | None:
         chave = str(caminho.resolve())
         if chave in self.amostras:
             return False
 
         dados = self.controller.load_chromatogram(caminho)
-        picos = self.controller.apply_saved_peaks(
-            chave,
-            self._criar_dataframe_picos_vazio(),
-        )
+        picos = self._detectar_picos_amostra(dados, chave)
 
         if metadados is not None:
-            metodo_analise, eh_diesel, ensaio = metadados
+            metodo_analise, eh_diesel = metadados
         elif perguntar_metadados:
             metadados = self._perguntar_metadados_amostra(caminho, chave)
             if metadados is None:
                 return None
-            metodo_analise, eh_diesel, ensaio = metadados
+            metodo_analise, eh_diesel = metadados
         else:
             metodo_analise = self._carregar_metodo_amostra(chave)
             eh_diesel = self._carregar_diesel_amostra(chave, caminho)
-            ensaio = self._carregar_ensaio_amostra(chave, caminho)
 
         amostra = Amostra(
             caminho=caminho,
@@ -2272,7 +2408,6 @@ class JanelaPrincipal(QMainWindow):
             picos=picos,
             metodo_analise=metodo_analise,
             eh_diesel=eh_diesel,
-            ensaio=ensaio,
         )
         self.amostras[chave] = amostra
         self._salvar_metadados_amostra(chave, amostra)
@@ -2325,7 +2460,6 @@ class JanelaPrincipal(QMainWindow):
         self.abas_tabelas.setCurrentWidget(self.tabela_amostras)
 
         tipo_amostra = self._obter_tipo_amostra(amostra)
-        ensaio = self._obter_ensaio_amostra(amostra)
         resumo_padrao = (
             f"Padrão: {self.padrao.caminho.name}"
             if self.padrao is not None
@@ -2333,11 +2467,11 @@ class JanelaPrincipal(QMainWindow):
         )
         self.label_resumo.setText(
             f"Amostra: {amostra.caminho.name}\n"
-            f"Método: {metodo_analise} | {tipo_amostra} | {ensaio}\n"
+            f"Método: {metodo_analise} | {tipo_amostra}\n"
             f"{resumo_padrao}"
         )
         self.statusBar().showMessage(
-            f"Visualizando: {amostra.caminho.name} | {metodo_analise} | {tipo_amostra} | {ensaio}"
+            f"Visualizando: {amostra.caminho.name} | {metodo_analise} | {tipo_amostra}"
         )
 
     def _atualizar_grafico(
@@ -2968,6 +3102,13 @@ class JanelaPrincipal(QMainWindow):
             if pd.notna(area):
                 resumo.at[indice, "Área Total"] = float(area)
 
+        grupos_zerados = self._carregar_grupos_zerados_amostra(chave_atual)
+        if grupos_zerados:
+            for indice, linha in resumo.iterrows():
+                grupo = str(linha.get("Grupos", "")).strip()
+                if grupo in grupos_zerados:
+                    resumo.at[indice, "Área Total"] = 0.0
+
         return self._adicionar_percentual_area(resumo, "Área Total")
 
     def _atualizar_tabela_regioes(
@@ -3182,7 +3323,6 @@ class JanelaPrincipal(QMainWindow):
 def main() -> int:
     """Inicializa a aplicação Qt e exibe a janela principal."""
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationDisplayName("SFC - Visualizador de Cromatogramas")
 
     janela = JanelaPrincipal()
     janela.show()
