@@ -50,6 +50,7 @@ class MainController:
         noise_factor: float,
         rel_height: float,
         curvature_factor: float,
+        apply_deconvolution: bool = True,
     ) -> pd.DataFrame:
         return processing_service.detectar_picos_dataframe(
             dados,
@@ -62,6 +63,7 @@ class MainController:
             noise_factor=noise_factor,
             rel_height=rel_height,
             curvature_factor=curvature_factor,
+            apply_deconvolution=apply_deconvolution,
         )
 
     def detect_standard_peaks(

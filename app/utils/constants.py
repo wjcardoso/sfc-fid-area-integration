@@ -34,33 +34,33 @@ COLUNAS_REGIOES = [
 ]
 
 REGIOES_ANALITICAS_D5186_DIESEL = [
-    ("Não-aromaticos", 4.58, 5.87),
-    ("Mono-aromaticos", 5.87, 9.85),
+    ("Não-aromaticos", 4.58, 6.3),
+    ("Mono-aromaticos", 6.3, 9.85),
     ("Di-aromaticos", 9.85, 16.49),
     ("Tri-aromaticos+", 16.49, 25.08),
 ]
 
 REGIOES_ANALITICAS_D5186_NAO_DIESEL = [
-    ("Não-aromaticos", 4.58, 5.87),
-    ("Mono-aromaticos", 5.87, 9.85),
+    ("Não-aromaticos", 4.58, 6.3),
+    ("Mono-aromaticos", 6.3, 9.85),
     ("Poli-aromaticos", 9.85, 25.08),
 ]
 
 REGIOES_ANALITICAS_D6550_DIESEL = [
-    ("Saturados", 4.58, 5.87),
-    ("Mono-aromaticos", 5.87, 9.85),
+    ("Saturados", 4.58, 6.3),
+    ("Mono-aromaticos", 6.3, 9.85),
     ("Di-aromaticos", 9.85, 16.49),
     ("Tri-aromaticos+", 16.49, 25.08),
-    ("Saturados pesados", 25.08, 25.17),
-    ("Olefinas", 27.29, 32.88),
+    ("Saturados pesados", 32, 32.2),
+    ("Olefinas", 34, 45),
 ]
 
 REGIOES_ANALITICAS_D6550_NAO_DIESEL = [
-    ("Saturados", 4.58, 5.87),
-    ("Mono-aromaticos", 5.87, 9.85),
+    ("Saturados", 4.58, 6.3),
+    ("Mono-aromaticos", 6.3, 9.85),
     ("Poli-aromaticos", 9.85, 25.08),
-    ("Saturados pesados", 25.08, 25.17),
-    ("Olefinas", 27.29, 32.88),
+    ("Saturados pesados", 25, 25.3),
+    ("Olefinas", 27, 40),
 ]
 
 REGIOES_ANALITICAS_POR_METODO = {

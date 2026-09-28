@@ -961,6 +961,7 @@ def detectar_picos_dataframe(
     noise_factor: float = 4.0,
     rel_height: float = 0.98,
     curvature_factor: float = 1.5,
+    apply_deconvolution: bool = True,
 ) -> pd.DataFrame:
     """Detecta picos com heurísticas robustas para picos isolados e sobrepostos.
 
@@ -979,9 +980,17 @@ def detectar_picos_dataframe(
     if len(intensidade) < 5:
         return criar_dataframe_picos_vazio(colunas_amostra)
 
+    altura_configurada = float(altura_minima_pico)
+    altura_maxima_sinal = float(np.nanmax(intensidade)) if len(intensidade) else 0.0
+    if not np.isfinite(altura_configurada) or altura_configurada < 0:
+        altura_configurada = 0.0
+    # Evita bloqueio total quando o limiar absoluto está muito acima do sinal atual.
+    if altura_maxima_sinal > 0 and altura_configurada > altura_maxima_sinal * 1.2:
+        altura_configurada = 0.0
+
     config = PeakDetectionConfig.from_legacy(
         signal_length=len(intensidade),
-        min_height=altura_minima_pico,
+        min_height=altura_configurada,
         smoothing_window=janela_suavizacao,
         distance_divisor=divisor_distancia_minima,
     )
@@ -1013,13 +1022,14 @@ def detectar_picos_dataframe(
         return criar_dataframe_picos_vazio(colunas_amostra)
 
     sinal_suavizado = np.asarray(propriedades["signal_smooth"], dtype=float)
-    indices_picos, propriedades = _expandir_ombros_por_deconvolucao(
-        tempo,
-        sinal_suavizado,
-        np.asarray(indices_picos, dtype=int),
-        propriedades,
-        config,
-    )
+    if apply_deconvolution:
+        indices_picos, propriedades = _expandir_ombros_por_deconvolucao(
+            tempo,
+            sinal_suavizado,
+            np.asarray(indices_picos, dtype=int),
+            propriedades,
+            config,
+        )
     sinal_suavizado = np.asarray(propriedades["signal_smooth"], dtype=float)
     derivada = np.gradient(sinal_suavizado, tempo)
     curvatura = np.gradient(derivada, tempo)
@@ -1040,20 +1050,21 @@ def detectar_picos_dataframe(
         vales_direita[pos] = vale
         vales_esquerda[pos + 1] = vale
 
-    (
-        candidatos_esquerda,
-        candidatos_direita,
-        vales_esquerda,
-        vales_direita,
-    ) = _ajustar_limites_sobrepostos_por_deconvolucao(
-        tempo,
-        sinal_suavizado,
-        np.asarray(indices_picos, dtype=int),
-        np.asarray(candidatos_esquerda, dtype=int),
-        np.asarray(candidatos_direita, dtype=int),
-        vales_esquerda,
-        vales_direita,
-    )
+    if apply_deconvolution:
+        (
+            candidatos_esquerda,
+            candidatos_direita,
+            vales_esquerda,
+            vales_direita,
+        ) = _ajustar_limites_sobrepostos_por_deconvolucao(
+            tempo,
+            sinal_suavizado,
+            np.asarray(indices_picos, dtype=int),
+            np.asarray(candidatos_esquerda, dtype=int),
+            np.asarray(candidatos_direita, dtype=int),
+            vales_esquerda,
+            vales_direita,
+        )
 
     registros_picos: list[dict[str, float]] = []
     raio_refino = max(2, config.smoothing_window)
@@ -1145,6 +1156,125 @@ def detectar_picos_padrao_referenciados(
     curvature_factor: float = 1.5,
 ) -> pd.DataFrame:
     """Associa os picos detectados às janelas analíticas do padrão."""
+
+    def montar_por_apice_local() -> pd.DataFrame:
+        tempos = pd.to_numeric(df.get("Tempo"), errors="coerce")
+        intensidades = pd.to_numeric(df.get("Intensidade"), errors="coerce")
+        if tempos is None or intensidades is None:
+            return criar_dataframe_padrao_vazio(colunas_amostra)
+
+        base_local = pd.DataFrame(
+            {
+                "Tempo": tempos,
+                "Intensidade": intensidades,
+                "Intensidade_Bruta": pd.to_numeric(
+                    df.get("Intensidade_Bruta", intensidades), errors="coerce"
+                ),
+            }
+        ).dropna(subset=["Tempo", "Intensidade"])
+        if base_local.empty:
+            return criar_dataframe_padrao_vazio(colunas_amostra)
+
+        base_local = base_local.sort_values("Tempo").reset_index(drop=True)
+        tempo_np = base_local["Tempo"].to_numpy(dtype=float)
+        intensidade_np = base_local["Intensidade"].to_numpy(dtype=float)
+        intensidade_bruta_np = (
+            pd.to_numeric(base_local["Intensidade_Bruta"], errors="coerce")
+            .fillna(base_local["Intensidade"])
+            .to_numpy(dtype=float)
+        )
+        tempo_s = tempo_np * 60.0
+
+        amplitude_ref = max(float(np.nanmax(intensidade_np)), 1e-9)
+        ruido_ref = float(np.nanstd(intensidade_np))
+        prominencia_min = max(amplitude_ref * 0.005, ruido_ref * 0.8, 1e-9)
+        distancia_min = max(2, len(intensidade_np) // max(divisor_distancia_minima, 1))
+        picos_globais, _ = find_peaks(
+            intensidade_np,
+            prominence=prominencia_min,
+            distance=distancia_min,
+        )
+
+        registros: list[dict[str, float | str]] = []
+        tempo_min = float(np.min(tempo_np))
+        tempo_max = float(np.max(tempo_np))
+        for numero, (_, referencia) in enumerate(
+            referencias_base.sort_values("Tempo (min)").iterrows(),
+            start=1,
+        ):
+            composto = str(referencia["Composto"])
+            tempo_esperado = float(referencia["Tempo (min)"])
+            inicio_ref = float(referencia["Início"])
+            fim_ref = float(referencia["Fim"])
+            largura_ref = max(fim_ref - inicio_ref, 0.20)
+            meia_largura = max(largura_ref * 0.5, 0.10)
+            janela = max(0.50, largura_ref * 3.5)
+
+            mascara = (tempo_np >= tempo_esperado - janela) & (
+                tempo_np <= tempo_esperado + janela
+            )
+            indices = np.flatnonzero(mascara)
+            if len(indices) == 0:
+                continue
+
+            inicio_janela_idx = int(indices[0])
+            fim_janela_idx = int(indices[-1])
+            picos_janela = picos_globais[
+                (picos_globais >= inicio_janela_idx) & (picos_globais <= fim_janela_idx)
+            ]
+
+            if len(picos_janela) == 0:
+                sinal_janela = intensidade_np[inicio_janela_idx : fim_janela_idx + 1]
+                picos_locais, _ = find_peaks(
+                    sinal_janela,
+                    prominence=max(prominencia_min * 0.5, 1e-9),
+                    distance=max(1, distancia_min // 2),
+                )
+                if len(picos_locais) > 0:
+                    picos_janela = inicio_janela_idx + picos_locais
+
+            if len(picos_janela) > 0:
+                tempos_candidatos = tempo_np[picos_janela]
+                desvios = np.abs(tempos_candidatos - tempo_esperado)
+                ordem = np.lexsort((-intensidade_np[picos_janela], desvios))
+                idx_apice = int(picos_janela[int(ordem[0])])
+            else:
+                idx_apice = int(indices[np.argmax(intensidade_np[indices])])
+
+            tempo_apice = float(tempo_np[idx_apice])
+            inicio = max(tempo_min, tempo_apice - meia_largura)
+            fim = min(tempo_max, tempo_apice + meia_largura)
+
+            idx_inicio = int(np.searchsorted(tempo_np, inicio, side="left"))
+            idx_fim = int(np.searchsorted(tempo_np, fim, side="right") - 1)
+            idx_inicio = int(np.clip(idx_inicio, 0, len(tempo_np) - 1))
+            idx_fim = int(np.clip(idx_fim, idx_inicio, len(tempo_np) - 1))
+
+            area = calcular_area_pico_local(
+                tempo_s,
+                intensidade_bruta_np,
+                idx_inicio,
+                idx_fim,
+            )
+
+            registros.append(
+                {
+                    "Composto": composto,
+                    "Pico": numero,
+                    "Tempo (min)": tempo_apice,
+                    "Altura": float(intensidade_np[idx_apice]),
+                    "Início": float(tempo_np[idx_inicio]),
+                    "Fim": float(tempo_np[idx_fim]),
+                    "Largura": float(tempo_np[idx_fim] - tempo_np[idx_inicio]),
+                    "Área": float(area),
+                }
+            )
+
+        if not registros:
+            return criar_dataframe_padrao_vazio(colunas_amostra)
+
+        return pd.DataFrame(registros, columns=["Composto", *colunas_amostra])
+
     picos_detectados = detectar_picos_dataframe(
         df,
         colunas_amostra,
@@ -1157,8 +1287,30 @@ def detectar_picos_padrao_referenciados(
         rel_height=rel_height,
         curvature_factor=curvature_factor,
     ).copy()
+
     if picos_detectados.empty:
-        return criar_dataframe_padrao_vazio(colunas_amostra)
+        intensidade = pd.to_numeric(df.get("Intensidade"), errors="coerce")
+        altura_relaxada = max(
+            1e-6,
+            float(np.nanmax(intensidade.to_numpy(dtype=float))) * 0.03
+            if intensidade is not None and intensidade.notna().any()
+            else 1e-6,
+        )
+        picos_detectados = detectar_picos_dataframe(
+            df,
+            colunas_amostra,
+            min(float(altura_minima_pico), altura_relaxada),
+            janela_suavizacao,
+            divisor_distancia_minima,
+            min_prominence=None,
+            min_width=max(2, int(min_width if min_width is not None else 2)),
+            noise_factor=max(1.5, float(noise_factor) * 0.6),
+            rel_height=rel_height,
+            curvature_factor=curvature_factor,
+        ).copy()
+
+    if picos_detectados.empty:
+        return montar_por_apice_local()
 
     referencias_ordenadas = referencias_base.sort_values("Tempo (min)")
     picos_detectados = picos_detectados.sort_values("Tempo (min)").reset_index(
@@ -1184,20 +1336,28 @@ def detectar_picos_padrao_referenciados(
             break
 
         candidatos["Desvio"] = (candidatos["Tempo (min)"] - tempo_esperado).abs()
-        candidatos = candidatos[candidatos["Desvio"] <= tolerancia].copy()
-        if candidatos.empty:
-            continue
+        candidatos_dentro_janela = candidatos[candidatos["Desvio"] <= tolerancia].copy()
 
-        altura_maxima = max(float(candidatos["Altura"].max()), 1e-12)
-        candidatos["Score"] = candidatos["Desvio"] / tolerancia - 0.15 * (
-            candidatos["Altura"] / altura_maxima
-        )
-        melhor_idx = int(
-            candidatos.sort_values(
-                ["Score", "Desvio", "Altura"],
-                ascending=[True, True, False],
-            ).index[0]
-        )
+        if not candidatos_dentro_janela.empty:
+            altura_maxima = max(float(candidatos_dentro_janela["Altura"].max()), 1e-12)
+            candidatos_dentro_janela["Score"] = (
+                candidatos_dentro_janela["Desvio"] / tolerancia
+            ) - 0.15 * (candidatos_dentro_janela["Altura"] / altura_maxima)
+            melhor_idx = int(
+                candidatos_dentro_janela.sort_values(
+                    ["Score", "Desvio", "Altura"],
+                    ascending=[True, True, False],
+                ).index[0]
+            )
+        else:
+            # Fallback: ancora no ápice detectado mais próximo do tempo esperado.
+            melhor_idx = int(
+                candidatos.sort_values(
+                    ["Desvio", "Altura"],
+                    ascending=[True, False],
+                ).index[0]
+            )
+
         melhor = picos_detectados.loc[melhor_idx]
 
         registros_padrao.append(

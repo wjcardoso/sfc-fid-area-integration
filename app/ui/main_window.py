@@ -349,6 +349,7 @@ class JanelaPrincipal(QMainWindow):
         self,
         composto_esquerda: str,
         composto_direita: str,
+        dados_amostra: pd.DataFrame | None = None,
     ) -> float | None:
         referencia_esquerda = self._obter_referencia_padrao_composto(composto_esquerda)
         referencia_direita = self._obter_referencia_padrao_composto(composto_direita)
@@ -357,30 +358,160 @@ class JanelaPrincipal(QMainWindow):
 
         tempo_esquerda = referencia_esquerda.get("Tempo (min)")
         tempo_direita = referencia_direita.get("Tempo (min)")
-        if (
-            self.padrao is not None
-            and not self.padrao.dados.empty
-            and tempo_esquerda is not None
-            and tempo_direita is not None
-            and tempo_direita > tempo_esquerda
-        ):
-            janela = self.padrao.dados.loc[
-                (self.padrao.dados["Tempo"] >= float(tempo_esquerda))
-                & (self.padrao.dados["Tempo"] <= float(tempo_direita))
-            ]
-            if not janela.empty:
-                indice_vale = janela["Intensidade"].astype(float).idxmin()
-                tempo_vale = self._para_float_seguro(janela.loc[indice_vale, "Tempo"])
-                if tempo_vale is not None:
-                    return tempo_vale
-
         fim_esquerda = referencia_esquerda.get("Fim")
         inicio_direita = referencia_direita.get("Início")
+
+        janela_inicio = (
+            float(fim_esquerda)
+            if fim_esquerda is not None
+            else (float(tempo_esquerda) if tempo_esquerda is not None else None)
+        )
+        janela_fim = (
+            float(inicio_direita)
+            if inicio_direita is not None
+            else (float(tempo_direita) if tempo_direita is not None else None)
+        )
+
+        if (
+            (janela_inicio is None or janela_fim is None or janela_fim <= janela_inicio)
+            and tempo_esquerda is not None
+            and tempo_direita is not None
+        ):
+            esquerda = float(tempo_esquerda)
+            direita = float(tempo_direita)
+            if direita > esquerda:
+                janela_inicio, janela_fim = esquerda, direita
+
+        if (
+            dados_amostra is not None
+            and not dados_amostra.empty
+            and janela_inicio is not None
+            and janela_fim is not None
+            and janela_fim > janela_inicio
+        ):
+            tempo_vale = self._detectar_vale_local_robusto(
+                dados_amostra,
+                janela_inicio,
+                janela_fim,
+            )
+            if tempo_vale is not None:
+                return tempo_vale
+
+        if (
+            janela_inicio is not None
+            and janela_fim is not None
+            and janela_fim > janela_inicio
+        ):
+            # Fallback determinístico: ponto médio da janela ancorada no padrão.
+            return (float(janela_inicio) + float(janela_fim)) / 2.0
+
         if fim_esquerda is not None and inicio_direita is not None:
             return (float(fim_esquerda) + float(inicio_direita)) / 2.0
         if tempo_esquerda is not None and tempo_direita is not None:
             return (float(tempo_esquerda) + float(tempo_direita)) / 2.0
         return fim_esquerda if fim_esquerda is not None else inicio_direita
+
+    @staticmethod
+    def _suavizar_intensidade_local(
+        intensidade: pd.Series,
+        janela_suavizacao: int,
+    ) -> pd.Series:
+        serie = pd.to_numeric(intensidade, errors="coerce").astype(float)
+        if len(serie) < 3:
+            return serie
+
+        janela = max(int(janela_suavizacao), 3)
+        if janela % 2 == 0:
+            janela += 1
+        if janela >= len(serie):
+            janela = len(serie) if len(serie) % 2 == 1 else len(serie) - 1
+        if janela < 3:
+            return serie
+
+        return (
+            serie.rolling(window=janela, center=True, min_periods=1)
+            .median()
+            .rolling(window=3, center=True, min_periods=1)
+            .mean()
+        )
+
+    def _detectar_vale_local_robusto(
+        self,
+        dados: pd.DataFrame,
+        inicio_janela: float,
+        fim_janela: float,
+    ) -> float | None:
+        if (
+            dados is None
+            or dados.empty
+            or "Tempo" not in dados.columns
+            or "Intensidade" not in dados.columns
+        ):
+            return None
+
+        tempo = pd.to_numeric(dados["Tempo"], errors="coerce")
+        intensidade = pd.to_numeric(dados["Intensidade"], errors="coerce")
+        janela = pd.DataFrame({"Tempo": tempo, "Intensidade": intensidade}).dropna()
+        janela = janela.loc[
+            (janela["Tempo"] >= float(inicio_janela))
+            & (janela["Tempo"] <= float(fim_janela))
+        ].copy()
+
+        if len(janela) < 5:
+            return None
+
+        janela.sort_values("Tempo", inplace=True)
+        janela.reset_index(drop=True, inplace=True)
+        janela["IntensidadeSuave"] = self._suavizar_intensidade_local(
+            janela["Intensidade"],
+            self.JANELA_SUAVIZACAO,
+        )
+
+        y = janela["IntensidadeSuave"].astype(float).reset_index(drop=True)
+        t = janela["Tempo"].astype(float).reset_index(drop=True)
+        n = len(janela)
+        if n < 5:
+            return None
+
+        margem_idx = max(1, min(5, n // 12))
+        intervalo = max(float(fim_janela) - float(inicio_janela), 1e-9)
+        margem_tempo = 0.03 * intervalo
+
+        candidatos: list[int] = []
+        for idx in range(1, n - 1):
+            if not (y.iloc[idx] <= y.iloc[idx - 1] and y.iloc[idx] < y.iloc[idx + 1]):
+                continue
+            if idx <= margem_idx or idx >= (n - 1 - margem_idx):
+                continue
+            dist_esquerda = float(t.iloc[idx] - float(inicio_janela))
+            dist_direita = float(float(fim_janela) - t.iloc[idx])
+            if dist_esquerda < margem_tempo or dist_direita < margem_tempo:
+                continue
+            candidatos.append(idx)
+
+        if not candidatos:
+            return None
+
+        ruido_local = float(y.diff().abs().median()) if n > 1 else 0.0
+        amplitude_local = float(y.quantile(0.90) - y.quantile(0.10))
+        contraste_minimo = max(2.0 * ruido_local, 0.04 * amplitude_local, 1e-12)
+
+        melhor_idx: int | None = None
+        melhor_profundidade = float("-inf")
+        for idx in candidatos:
+            max_esquerda = float(y.iloc[:idx].max())
+            max_direita = float(y.iloc[idx + 1 :].max())
+            profundidade = min(max_esquerda, max_direita) - float(y.iloc[idx])
+            if profundidade < contraste_minimo:
+                continue
+            if profundidade > melhor_profundidade:
+                melhor_idx = idx
+                melhor_profundidade = profundidade
+
+        if melhor_idx is None:
+            return None
+
+        return float(t.iloc[melhor_idx])
 
     @staticmethod
     def _selecionar_pico_representativo(
@@ -439,12 +570,55 @@ class JanelaPrincipal(QMainWindow):
             ascending=[False, True],
         ).iloc[0]
 
-    @staticmethod
     def _estimar_fim_faixa_aromatica(
+        self,
         picos: pd.DataFrame,
         inicio_busca: float,
         limite_superior: float | None = None,
+        dados: pd.DataFrame | None = None,
     ) -> float | None:
+        if (
+            dados is not None
+            and not dados.empty
+            and "Tempo" in dados.columns
+            and "Intensidade" in dados.columns
+        ):
+            sinal = dados[["Tempo", "Intensidade"]].copy()
+            sinal["Tempo"] = pd.to_numeric(sinal["Tempo"], errors="coerce")
+            sinal["Intensidade"] = pd.to_numeric(sinal["Intensidade"], errors="coerce")
+            sinal = sinal.dropna(subset=["Tempo", "Intensidade"]).sort_values("Tempo")
+
+            limite = float(limite_superior) if limite_superior is not None else None
+            janela = sinal[sinal["Tempo"] >= float(inicio_busca)].copy()
+            if limite is not None:
+                janela = janela[janela["Tempo"] <= limite].copy()
+
+            if len(janela) >= 8:
+                y_suave = self._suavizar_intensidade_local(
+                    janela["Intensidade"],
+                    self.JANELA_SUAVIZACAO,
+                )
+                t = janela["Tempo"].astype(float).reset_index(drop=True)
+                y = y_suave.astype(float).reset_index(drop=True)
+
+                n = len(y)
+                cauda_n = max(6, min(25, n // 5))
+                cauda = y.iloc[-cauda_n:]
+                baseline = float(cauda.median())
+                ruido_baseline = (
+                    float(cauda.diff().abs().median()) if len(cauda) > 1 else 0.0
+                )
+                amplitude = float(y.quantile(0.90) - y.quantile(0.10))
+                tolerancia = max(2.0 * ruido_baseline, 0.015 * amplitude, 1e-12)
+                consecutivos = max(3, min(8, n // 20 if n >= 20 else 3))
+
+                for idx in range(0, n - consecutivos + 1):
+                    bloco = y.iloc[idx : idx + consecutivos]
+                    if float(bloco.max()) <= baseline + tolerancia:
+                        tempo_retorno = float(t.iloc[idx])
+                        if limite is None or tempo_retorno <= limite:
+                            return tempo_retorno
+
         if picos.empty:
             return None
 
@@ -581,6 +755,7 @@ class JanelaPrincipal(QMainWindow):
         limite_hexadecano_tolueno = self._calcular_vale_entre_compostos_padrao(
             "Hexadecano",
             "Tolueno",
+            dados_amostra=dados,
         )
         inicio_tolueno = referencia_tolueno.get("Início") or referencia_tolueno.get(
             "Tempo (min)"
@@ -648,6 +823,7 @@ class JanelaPrincipal(QMainWindow):
                 picos_validos,
                 float(inicio_busca_final),
                 limite_superior_aromaticos,
+                dados=dados,
             )
             if inicio_busca_final is not None
             else None
@@ -972,7 +1148,12 @@ class JanelaPrincipal(QMainWindow):
         )
 
     def _detectar_picos_amostra(
-        self, dados: pd.DataFrame, chave: str | None = None
+        self,
+        dados: pd.DataFrame,
+        chave: str | None = None,
+        *,
+        apply_deconvolution: bool = True,
+        apply_saved_peaks: bool = True,
     ) -> pd.DataFrame:
         picos = self.controller.detect_sample_peaks(
             dados,
@@ -985,8 +1166,11 @@ class JanelaPrincipal(QMainWindow):
             noise_factor=self.FATOR_RUIDO,
             rel_height=self.ALTURA_RELATIVA_PICO,
             curvature_factor=self.FATOR_CURVATURA,
+            apply_deconvolution=apply_deconvolution,
         )
-        return self.controller.apply_saved_peaks(chave, picos) if chave else picos
+        if chave and apply_saved_peaks:
+            return self.controller.apply_saved_peaks(chave, picos)
+        return picos
 
     def _detectar_picos_padrao(self, dados: pd.DataFrame) -> pd.DataFrame:
         return self.controller.detect_standard_peaks(
@@ -1733,6 +1917,7 @@ class JanelaPrincipal(QMainWindow):
         amostra_atual.picos = self._detectar_picos_amostra(
             amostra_atual.dados,
             chave_atual,
+            apply_saved_peaks=False,
         )
         self._limpar_vinculos_grupos_invalidos(chave_atual, amostra_atual.picos)
         self.controller.save_sample_peaks(chave_atual, amostra_atual.picos)
@@ -1765,16 +1950,10 @@ class JanelaPrincipal(QMainWindow):
             )
             return
 
-        vinculos = self._carregar_vinculos_grupos_amostra(chave_atual)
-        grupos_redefinidos = len(vinculos)
-        if vinculos:
-            self._salvar_vinculos_grupos_amostra(chave_atual, {})
-        self._limpar_vinculos_grupos_invalidos(chave_atual, amostra_atual.picos)
-
-        amostra_atual.picos = self._integrar_grupos_como_picos(
-            chave_atual, amostra_atual
+        grupos_redefinidos = self._executar_logica_encontrar_grupos(
+            chave_atual,
+            amostra_atual,
         )
-        self.controller.save_sample_peaks(chave_atual, amostra_atual.picos)
 
         item_atual = self.lista_arquivos.currentItem()
         if item_atual is not None:
@@ -1789,16 +1968,40 @@ class JanelaPrincipal(QMainWindow):
             )
         )
 
+    def _executar_logica_encontrar_grupos(
+        self,
+        chave: str,
+        amostra: Amostra,
+    ) -> int:
+        vinculos = self._carregar_vinculos_grupos_amostra(chave)
+        grupos_redefinidos = len(vinculos)
+        if vinculos:
+            self._salvar_vinculos_grupos_amostra(chave, {})
+        self._limpar_vinculos_grupos_invalidos(chave, amostra.picos)
+
+        amostra.picos = self._integrar_grupos_como_picos(chave, amostra)
+        self.controller.save_sample_peaks(chave, amostra.picos)
+        return grupos_redefinidos
+
     def _integrar_grupos_como_picos(
         self,
         chave: str,
         amostra: Amostra,
     ) -> pd.DataFrame:
+        # Recalcular grupos sem deconvolução para evitar que a separação de ombros
+        # altere automaticamente os limites de grupos cromatográficos.
+        picos_para_grupos = self._detectar_picos_amostra(
+            amostra.dados,
+            apply_deconvolution=False,
+        )
+
         metodo = self._obter_metodo_amostra(amostra)
         df_regioes = self._calcular_areas_por_regiao(
-            amostra.picos,
+            picos_para_grupos,
             metodo,
             amostra.eh_diesel,
+            dados_amostra=amostra.dados,
+            chave_amostra=chave,
         )
 
         if df_regioes.empty:
@@ -2389,7 +2592,6 @@ class JanelaPrincipal(QMainWindow):
             return False
 
         dados = self.controller.load_chromatogram(caminho)
-        picos = self._detectar_picos_amostra(dados, chave)
 
         if metadados is not None:
             metodo_analise, eh_diesel = metadados
@@ -2405,13 +2607,13 @@ class JanelaPrincipal(QMainWindow):
         amostra = Amostra(
             caminho=caminho,
             dados=dados,
-            picos=picos,
+            picos=self._criar_dataframe_picos_vazio(),
             metodo_analise=metodo_analise,
             eh_diesel=eh_diesel,
         )
         self.amostras[chave] = amostra
         self._salvar_metadados_amostra(chave, amostra)
-        self._limpar_vinculos_grupos_invalidos(chave, amostra.picos)
+        self._executar_logica_encontrar_grupos(chave, amostra)
 
         item = QListWidgetItem()
         item.setToolTip(str(caminho))
@@ -3052,9 +3254,13 @@ class JanelaPrincipal(QMainWindow):
         picos: pd.DataFrame,
         metodo: str | None = None,
         eh_diesel: bool = False,
+        *,
+        dados_amostra: pd.DataFrame | None = None,
+        chave_amostra: str | None = None,
     ) -> pd.DataFrame:
-        _, amostra_atual = self._obter_amostra_atual()
-        dados_amostra = amostra_atual.dados if amostra_atual is not None else None
+        if dados_amostra is None:
+            _, amostra_atual = self._obter_amostra_atual()
+            dados_amostra = amostra_atual.dados if amostra_atual is not None else None
 
         resumo = self.controller.calculate_region_areas(
             picos,
@@ -3068,11 +3274,13 @@ class JanelaPrincipal(QMainWindow):
             dados=dados_amostra,
         )
 
-        chave_atual, _ = self._obter_amostra_atual()
-        if chave_atual is None or picos.empty or resumo.empty:
+        if chave_amostra is None:
+            chave_amostra, _ = self._obter_amostra_atual()
+
+        if chave_amostra is None or picos.empty or resumo.empty:
             return self._adicionar_percentual_area(resumo, "Área Total")
 
-        vinculos = self._carregar_vinculos_grupos_amostra(chave_atual)
+        vinculos = self._carregar_vinculos_grupos_amostra(chave_amostra)
         if not vinculos:
             return self._adicionar_percentual_area(resumo, "Área Total")
 
@@ -3102,7 +3310,7 @@ class JanelaPrincipal(QMainWindow):
             if pd.notna(area):
                 resumo.at[indice, "Área Total"] = float(area)
 
-        grupos_zerados = self._carregar_grupos_zerados_amostra(chave_atual)
+        grupos_zerados = self._carregar_grupos_zerados_amostra(chave_amostra)
         if grupos_zerados:
             for indice, linha in resumo.iterrows():
                 grupo = str(linha.get("Grupos", "")).strip()

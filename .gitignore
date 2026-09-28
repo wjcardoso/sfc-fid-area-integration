@@ -36,4 +36,8 @@ Padroes/
 *.xlsx
 *.dat.asc
 *.asc.txt
+tutorial/
+tutorial_files/
 
+.R
+.approj
